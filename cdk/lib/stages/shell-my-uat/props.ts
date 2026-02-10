@@ -94,6 +94,10 @@ export const ShellMyUatProps: IProps = {
                     clusterName: "my-shell-uat-rp-cluster",
                     serviceNames: [ "my-shell-uat-rp-service" ]
                 },
+                {
+                    clusterName: "my-shell-uat-dg-cluster",
+                    serviceNames: [ "my-shell-uat-dg-service" ]
+                }
             ]
         },
         rule: {
