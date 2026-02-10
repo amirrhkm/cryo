@@ -2,7 +2,8 @@ import {
     ApiGatewayV2Client, 
     CreateApiMappingCommand, 
     DeleteApiMappingCommand,
-    GetApiMappingsCommand
+    GetApiMappingsCommand,
+    GetApisCommand
 } from '@aws-sdk/client-apigatewayv2';
 import { LoggerService } from '../logger/logger.service';
 
@@ -20,6 +21,7 @@ interface ApiMappingState {
 export class ApiGatewayService {
     private readonly client: ApiGatewayV2Client;
     private readonly apiMappingStates: Map<string, ApiMappingState> = new Map();
+    private readonly apiIdCache: Map<string, string> = new Map();
 
     constructor(
         private readonly apiGateways: ApiGatewayConfig[],
@@ -104,12 +106,23 @@ export class ApiGatewayService {
 
     private async createApiMapping(config: ApiGatewayConfig): Promise<void> {
         try {
-            const existingMappingId = await this.findExistingMapping(config.domain, config.mapping);
+            const apiId = await this.getApiIdByName(config.mapping);
+            
+            if (!apiId) {
+                this.logger.error('[ApiGatewayService] API not found by name', {
+                    domain: config.domain,
+                    apiName: config.mapping,
+                });
+                throw new Error(`API not found: ${config.mapping}`);
+            }
+
+            const existingMappingId = await this.findExistingMapping(config.domain, apiId);
             
             if (existingMappingId) {
                 this.logger.info('[ApiGatewayService] API mapping already exists', {
                     domain: config.domain,
-                    mapping: config.mapping,
+                    apiName: config.mapping,
+                    apiId,
                     apiMappingId: existingMappingId,
                 });
                 return;
@@ -118,7 +131,7 @@ export class ApiGatewayService {
             const response = await this.client.send(
                 new CreateApiMappingCommand({
                     DomainName: config.domain,
-                    ApiId: config.mapping,
+                    ApiId: apiId,
                     Stage: '$default',
                 })
             );
@@ -131,14 +144,15 @@ export class ApiGatewayService {
 
             this.logger.info('[ApiGatewayService] API mapping created', {
                 domain: config.domain,
-                mapping: config.mapping,
+                apiName: config.mapping,
+                apiId,
                 apiMappingId: response.ApiMappingId,
             });
         } catch (error: any) {
             if (error.name === 'ConflictException') {
                 this.logger.info('[ApiGatewayService] API mapping already exists (conflict)', {
                     domain: config.domain,
-                    mapping: config.mapping,
+                    apiName: config.mapping,
                 });
                 return;
             }
@@ -148,12 +162,23 @@ export class ApiGatewayService {
 
     private async deleteApiMapping(config: ApiGatewayConfig): Promise<void> {
         try {
-            const apiMappingId = await this.findExistingMapping(config.domain, config.mapping);
+            const apiId = await this.getApiIdByName(config.mapping);
+            
+            if (!apiId) {
+                this.logger.warn('[ApiGatewayService] API not found by name, cannot delete mapping', {
+                    domain: config.domain,
+                    apiName: config.mapping,
+                });
+                return;
+            }
+
+            const apiMappingId = await this.findExistingMapping(config.domain, apiId);
 
             if (!apiMappingId) {
                 this.logger.info('[ApiGatewayService] API mapping not found, nothing to delete', {
                     domain: config.domain,
-                    mapping: config.mapping,
+                    apiName: config.mapping,
+                    apiId,
                 });
                 return;
             }
@@ -169,14 +194,15 @@ export class ApiGatewayService {
 
             this.logger.info('[ApiGatewayService] API mapping deleted', {
                 domain: config.domain,
-                mapping: config.mapping,
+                apiName: config.mapping,
+                apiId,
                 apiMappingId,
             });
         } catch (error: any) {
             if (error.name === 'NotFoundException') {
                 this.logger.info('[ApiGatewayService] API mapping not found (already deleted)', {
                     domain: config.domain,
-                    mapping: config.mapping,
+                    apiName: config.mapping,
                 });
                 return;
             }
@@ -198,6 +224,41 @@ export class ApiGatewayService {
             if (error.name === 'NotFoundException') {
                 return null;
             }
+            throw error;
+        }
+    }
+
+    private async getApiIdByName(apiName: string): Promise<string | null> {
+        if (this.apiIdCache.has(apiName)) {
+            return this.apiIdCache.get(apiName)!;
+        }
+
+        try {
+            this.logger.info('[ApiGatewayService] Looking up API ID by name', { apiName });
+            
+            const response = await this.client.send(new GetApisCommand({}));
+            
+            const api = response.Items?.find((item) => item.Name === apiName);
+            
+            if (api?.ApiId) {
+                this.logger.info('[ApiGatewayService] Found API ID', {
+                    apiName,
+                    apiId: api.ApiId,
+                });
+                this.apiIdCache.set(apiName, api.ApiId);
+                return api.ApiId;
+            }
+
+            this.logger.warn('[ApiGatewayService] API not found', {
+                apiName,
+                availableApis: response.Items?.map(item => item.Name) || [],
+            });
+            return null;
+        } catch (error: any) {
+            this.logger.error('[ApiGatewayService] Failed to lookup API by name', {
+                apiName,
+                error: error.message,
+            });
             throw error;
         }
     }

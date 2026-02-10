@@ -231,6 +231,8 @@ export class Controller extends Construct {
                         'apigateway:PATCH',
                     ],
                     resources: [
+                        `arn:aws:apigateway:${props.vpc.region}::/apis`,
+                        `arn:aws:apigateway:${props.vpc.region}::/apis/*`,
                         `arn:aws:apigateway:${props.vpc.region}::/domainnames/*`,
                         `arn:aws:apigateway:${props.vpc.region}::/domainnames/*/apimappings`,
                         `arn:aws:apigateway:${props.vpc.region}::/domainnames/*/apimappings/*`,

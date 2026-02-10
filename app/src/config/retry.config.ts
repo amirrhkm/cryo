@@ -25,10 +25,6 @@ export interface IRetryConfig {
     reconciliation: {
         rdsAutoRestartDelayMs: number;
     };
-    completionCheck: {
-        maxAttempts: number;
-        delayMinutes: number;
-    };
 }
 
 export const DEFAULT_RETRY_CONFIG: IRetryConfig = {
@@ -57,11 +53,7 @@ export const DEFAULT_RETRY_CONFIG: IRetryConfig = {
     },
     reconciliation: {
         rdsAutoRestartDelayMs: 300000,
-    },
-    completionCheck: {
-        maxAttempts: this.config.getConfig().completionCheck.maxAttempts,
-        delayMinutes: this.config.getConfig().completionCheck.delayMinutes,
-    },
+    }
 };
 
 export function getRetryConfig(): IRetryConfig {
