@@ -43,10 +43,12 @@ export class EcsService {
         this.logger.info('[EcsService] Saved all ECS desired counts');
     }
 
-    async scaleDown(): Promise<void> {
-        this.logger.info('[EcsService] Scaling down ECS services');
+    async scaleDown(saveCountsFirst: boolean = true): Promise<void> {
+        this.logger.info('[EcsService] Scaling down ECS services', { saveCountsFirst });
 
-        await this.saveDesiredCounts();
+        if (saveCountsFirst) {
+            await this.saveDesiredCounts();
+        }
 
         for (const cluster of this.clusters) {
             for (const serviceName of cluster.serviceNames) {
@@ -180,7 +182,7 @@ export class EcsService {
         if (desiredState === 'up') {
             await this.scaleUp();
         } else {
-            await this.scaleDown();
+            await this.scaleDown(false);
         }
     }
 
