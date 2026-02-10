@@ -14,6 +14,7 @@ export interface ICryoConfig {
         domain: string;
         mapping: string;
     }>;
+    rdsListenerRuleNames: string[];
     autoDisableRuleName: string;
     completionCheck: {
         name: string;

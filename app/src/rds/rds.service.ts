@@ -223,7 +223,6 @@ export class RdsService {
             isRdsAutoRestart,
         });
 
-        // Check current state
         const describeResponse = await this.rdsClient.send(
             new DescribeDBClustersCommand({ DBClusterIdentifier: clusterIdentifier })
         );
@@ -245,7 +244,6 @@ export class RdsService {
             desiredState,
         });
 
-        // Perform the reconciliation
         if (desiredState === 'available') {
             try {
                 await this.rdsClient.send(

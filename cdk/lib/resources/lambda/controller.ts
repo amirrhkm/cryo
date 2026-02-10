@@ -75,9 +75,14 @@ export class Controller extends Construct {
         const ecsClusters = JSON.stringify(props.resources.ecs?.clusters || []);
         const ruleNames = props.resources.rule?.name?.join(',') || '';
         const apiGwNames = JSON.stringify(props.resources.apiGw?.api || []);
-        
+        const rdsClusterCount = props.resources.rds?.resources?.filter(r => r.type === 'cluster').length || 0;
+        const rdsListenerRuleNames = Array.from({ length: rdsClusterCount }, (_, i) => 
+            `cryo-${props.environment}-rds-${i}`
+        ).join(',');
         const maxAttempts = props.retryConfig.completionCheck?.maxAttempts || 10;
         const delayMinutes = props.retryConfig.completionCheck?.intervalMinutes || 5;
+
+        
 
         return {
             APP_ENV: props.environment,
@@ -86,6 +91,7 @@ export class Controller extends Construct {
             ECS_CLUSTERS: ecsClusters,
             RULE_NAMES: ruleNames,
             API_GW_NAMES: apiGwNames,
+            RDS_LISTENER_RULE_NAMES: rdsListenerRuleNames,
             COMPLETION_CHECK_MAX_ATTEMPTS: maxAttempts.toString(),
             COMPLETION_CHECK_DELAY_MINUTES: delayMinutes.toString(),
             AUTO_DISABLE_RULE_NAME: `cryo-${props.environment}-auto-disable`,
@@ -182,6 +188,11 @@ export class Controller extends Construct {
     }
 
     private addSchedulerPermissions(role: iam.Role, props: ControllerProps): void {
+        const rdsClusterCount = props.resources.rds?.resources?.filter(r => r.type === 'cluster').length || 0;
+        const rdsListenerRuleArns = Array.from({ length: rdsClusterCount }, (_, i) => 
+            `arn:aws:events:${props.vpc.region}:*:rule/cryo-${props.environment}-rds-${i}`
+        );
+
         role.addToPolicy(
             new iam.PolicyStatement({
                 effect: iam.Effect.ALLOW,
@@ -194,6 +205,7 @@ export class Controller extends Construct {
                 resources: [
                     `arn:aws:events:${props.vpc.region}:*:rule/cryo-${props.environment}-auto-disable`,
                     `arn:aws:events:${props.vpc.region}:*:rule/cryo-${props.environment}-completion-check`,
+                    ...rdsListenerRuleArns,
                 ],
             })
         );

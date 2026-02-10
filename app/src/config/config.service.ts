@@ -26,6 +26,7 @@ export class ConfigService {
             ecsClusters: this.parseEcsClusters(process.env.ECS_CLUSTERS || ''),
             ruleNames: this.parseCommaSeparated(process.env.RULE_NAMES || ''),
             apiGateways: this.parseApiGateways(process.env.API_GW_NAMES || ''),
+            rdsListenerRuleNames: this.parseCommaSeparated(process.env.RDS_LISTENER_RULE_NAMES || ''),
             autoDisableRuleName: process.env.AUTO_DISABLE_RULE_NAME || '',
             completionCheck: {
                 name: process.env.COMPLETION_CHECK_RULE_NAME || '',

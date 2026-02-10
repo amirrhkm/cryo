@@ -34,6 +34,7 @@ export class CryoControllerService {
         this.schedulerService = new SchedulerService(
             cryoConfig.autoDisableRuleName,
             cryoConfig.completionCheck.name,
+            cryoConfig.rdsListenerRuleNames,
             logger
         );
     }
@@ -82,6 +83,7 @@ export class CryoControllerService {
 
         await this.stateManager.setState('enabling');
         await this.stateManager.resetCompletionCheckAttempts();
+        await this.schedulerService.disableRdsListeners();
 
         await Promise.all([
             this.ec2Service.startNoWait(),
@@ -118,6 +120,7 @@ export class CryoControllerService {
 
         await this.stateManager.setState('disabling');
         await this.stateManager.resetCompletionCheckAttempts();
+        await this.schedulerService.enableRdsListeners();
 
         await Promise.all([
             this.ecsService.scaleDownNoWait(),

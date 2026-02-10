@@ -12,6 +12,7 @@ export class SchedulerService {
     constructor(
         private readonly autoDisableRuleName: string,
         private readonly completionCheckRuleName: string,
+        private readonly rdsListenerRuleNames: string[],
         private readonly logger: LoggerService
     ) {
         this.eventBridgeClient = new EventBridgeClient({});
@@ -113,6 +114,84 @@ export class SchedulerService {
                 error: error.message,
             });
             throw error;
+        }
+    }
+
+    async enableRdsListeners(): Promise<void> {
+        if (this.rdsListenerRuleNames.length === 0) {
+            this.logger.info('[SchedulerService] No RDS listener rules to enable');
+            return;
+        }
+
+        this.logger.info('[SchedulerService] Enabling RDS listener rules', {
+            ruleNames: this.rdsListenerRuleNames,
+            count: this.rdsListenerRuleNames.length,
+        });
+
+        const results = await Promise.allSettled(
+            this.rdsListenerRuleNames.map(async (ruleName) => {
+                try {
+                    await this.eventBridgeClient.send(
+                        new EnableRuleCommand({ Name: ruleName })
+                    );
+                    this.logger.info('[SchedulerService] RDS listener rule enabled', { ruleName });
+                } catch (error: any) {
+                    this.logger.error('[SchedulerService] Failed to enable RDS listener rule', {
+                        ruleName,
+                        error: error.message,
+                    });
+                    throw error;
+                }
+            })
+        );
+
+        const failures = results.filter((r) => r.status === 'rejected');
+        if (failures.length > 0) {
+            this.logger.warn('[SchedulerService] Some RDS listener rules failed to enable', {
+                failed: failures.length,
+                total: this.rdsListenerRuleNames.length,
+            });
+        } else {
+            this.logger.info('[SchedulerService] All RDS listener rules enabled successfully');
+        }
+    }
+
+    async disableRdsListeners(): Promise<void> {
+        if (this.rdsListenerRuleNames.length === 0) {
+            this.logger.info('[SchedulerService] No RDS listener rules to disable');
+            return;
+        }
+
+        this.logger.info('[SchedulerService] Disabling RDS listener rules', {
+            ruleNames: this.rdsListenerRuleNames,
+            count: this.rdsListenerRuleNames.length,
+        });
+
+        const results = await Promise.allSettled(
+            this.rdsListenerRuleNames.map(async (ruleName) => {
+                try {
+                    await this.eventBridgeClient.send(
+                        new DisableRuleCommand({ Name: ruleName })
+                    );
+                    this.logger.info('[SchedulerService] RDS listener rule disabled', { ruleName });
+                } catch (error: any) {
+                    this.logger.error('[SchedulerService] Failed to disable RDS listener rule', {
+                        ruleName,
+                        error: error.message,
+                    });
+                    throw error;
+                }
+            })
+        );
+
+        const failures = results.filter((r) => r.status === 'rejected');
+        if (failures.length > 0) {
+            this.logger.warn('[SchedulerService] Some RDS listener rules failed to disable', {
+                failed: failures.length,
+                total: this.rdsListenerRuleNames.length,
+            });
+        } else {
+            this.logger.info('[SchedulerService] All RDS listener rules disabled successfully');
         }
     }
 }
