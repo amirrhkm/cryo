@@ -1,6 +1,6 @@
 # Cryo - AWS Environment Cost-Control System
 
-Cryo is an intelligent cost-control system that enables/disables entire cloud environments by managing AWS resources without deletion. It provides automated scheduling, state management, and reconciliation for EC2, RDS Aurora, ECS, EventBridge rules, and API Gateway custom domain mappings.
+Cryo is a cost-control system that enables/disables cloud environments by managing AWS resources without deletion. It provides automated scheduling, state management, and reconciliation for EC2, RDS Aurora, ECS, EventBridge rules, and API Gateway custom domain mappings.
 
 ## 🎯 Features
 
