@@ -1,0 +1,32 @@
+{
+  "name": "cryo-controller",
+  "version": "1.0.0",
+  "description": "Cryo controller",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "aws",
+    "cryo",
+    "controller",
+    "lambda"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-apigatewayv2": "^3.986.0",
+    "@aws-sdk/client-ec2": "^3.490.0",
+    "@aws-sdk/client-ecs": "^3.490.0",
+    "@aws-sdk/client-eventbridge": "^3.490.0",
+    "@aws-sdk/client-rds": "^3.490.0",
+    "@aws-sdk/client-ssm": "^3.490.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.130",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  }
+}
