@@ -1,6 +1,6 @@
 import { IAccount } from "../../interfaces";
 
-export const ShellSgUatAccount: IAccount = {
+export const RonposUatAccount: IAccount = {
     account: "961740251423",
     region: "ap-southeast-1"
 };

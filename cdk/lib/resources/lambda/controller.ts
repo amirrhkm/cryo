@@ -1,6 +1,7 @@
 import { Construct } from "constructs";
 import {
     Duration,
+    Stack,
     aws_lambda as lambda,
     aws_iam as iam,
     aws_logs as logs
@@ -27,9 +28,14 @@ export interface ControllerProps {
 
 export class Controller extends Construct {
     public readonly function: lambda.Function;
+    public readonly account: string;
+    public readonly region: string;
 
     constructor(scope: Construct, id: string, props: ControllerProps) {
         super(scope, id);
+
+        this.account = Stack.of(this).account;
+        this.region = Stack.of(this).region;
 
         const vpc = Vpc.fromLookup(this, 'vpc', {
             vpcId: props.vpc.id,
@@ -55,6 +61,7 @@ export class Controller extends Construct {
     ): lambda.Function {
         return new lambda.Function(this, 'cryo-controller', {
             functionName: `cryo-controller-${props.environment}`,
+            reservedConcurrentExecutions: 1,
             handler: 'index.handler',
             runtime: props.runtime || lambda.Runtime.NODEJS_20_X,
             code: lambda.Code.fromAsset(path.join(__dirname, '../../../../app/dist')),
@@ -123,14 +130,25 @@ export class Controller extends Construct {
 
     private addEc2Permissions(role: iam.Role, props: ControllerProps): void {
         if (props.resources.ec2?.instanceIds && props.resources.ec2.instanceIds.length > 0) {
+            const instanceArns = props.resources.ec2.instanceIds.map(
+                instanceId => `arn:aws:ec2:${this.region}:${this.account}:instance/${instanceId}`
+            );
+
             role.addToPolicy(
                 new iam.PolicyStatement({
                     effect: iam.Effect.ALLOW,
                     actions: [
-                        'ec2:DescribeInstances',
                         'ec2:StartInstances',
                         'ec2:StopInstances',
                     ],
+                    resources: instanceArns,
+                })
+            );
+
+            role.addToPolicy(
+                new iam.PolicyStatement({
+                    effect: iam.Effect.ALLOW,
+                    actions: ['ec2:DescribeInstances'],
                     resources: ['*'],
                 })
             );
@@ -139,16 +157,33 @@ export class Controller extends Construct {
 
     private addRdsPermissions(role: iam.Role, props: ControllerProps): void {
         if (props.resources.rds?.resources && props.resources.rds.resources.length > 0) {
+            const rdsArns = props.resources.rds.resources.map(resource => {
+                if (resource.type === 'cluster') {
+                    return `arn:aws:rds:${this.region}:${this.account}:cluster:${resource.identifier}`;
+                } else {
+                    return `arn:aws:rds:${this.region}:${this.account}:db:${resource.identifier}`;
+                }
+            });
+
+            role.addToPolicy(
+                new iam.PolicyStatement({
+                    effect: iam.Effect.ALLOW,
+                    actions: [
+                        'rds:StartDBCluster',
+                        'rds:StopDBCluster',
+                        'rds:StartDBInstance',
+                        'rds:StopDBInstance',
+                    ],
+                    resources: rdsArns,
+                })
+            );
+
             role.addToPolicy(
                 new iam.PolicyStatement({
                     effect: iam.Effect.ALLOW,
                     actions: [
                         'rds:DescribeDBClusters',
-                        'rds:StartDBCluster',
-                        'rds:StopDBCluster',
                         'rds:DescribeDBInstances',
-                        'rds:StartDBInstance',
-                        'rds:StopDBInstance',
                     ],
                     resources: ['*'],
                 })
@@ -158,15 +193,33 @@ export class Controller extends Construct {
 
     private addEcsPermissions(role: iam.Role, props: ControllerProps): void {
         if (props.resources.ecs?.clusters && props.resources.ecs.clusters.length > 0) {
+            const clusterArns: string[] = [];
+            const serviceArns: string[] = [];
+
+            props.resources.ecs.clusters.forEach(cluster => {
+                clusterArns.push(`arn:aws:ecs:${this.region}:${this.account}:cluster/${cluster.clusterName}`);
+                
+                cluster.serviceNames.forEach(serviceName => {
+                    serviceArns.push(`arn:aws:ecs:${this.region}:${this.account}:service/${cluster.clusterName}/${serviceName}`);
+                });
+            });
+
             role.addToPolicy(
                 new iam.PolicyStatement({
                     effect: iam.Effect.ALLOW,
                     actions: [
                         'ecs:DescribeServices',
                         'ecs:UpdateService',
-                        'ecs:ListServices',
                     ],
-                    resources: ['*'],
+                    resources: serviceArns,
+                })
+            );
+
+            role.addToPolicy(
+                new iam.PolicyStatement({
+                    effect: iam.Effect.ALLOW,
+                    actions: ['ecs:ListServices'],
+                    resources: clusterArns,
                 })
             );
         }
@@ -181,7 +234,7 @@ export class Controller extends Construct {
                     'ssm:PutParameter',
                 ],
                 resources: [
-                    `arn:aws:ssm:${props.vpc.region}:*:parameter/cryo/*`,
+                    `arn:aws:ssm:${this.region}:${this.account}:parameter/cryo/*`,
                 ],
             })
         );
@@ -190,7 +243,7 @@ export class Controller extends Construct {
     private addSchedulerPermissions(role: iam.Role, props: ControllerProps): void {
         const rdsClusterCount = props.resources.rds?.resources?.filter(r => r.type === 'cluster').length || 0;
         const rdsListenerRuleArns = Array.from({ length: rdsClusterCount }, (_, i) => 
-            `arn:aws:events:${props.vpc.region}:*:rule/cryo-${props.environment}-rds-${i}`
+            `arn:aws:events:${this.region}:*:rule/cryo-${props.environment}-rds-${i}`
         );
 
         role.addToPolicy(
@@ -203,8 +256,8 @@ export class Controller extends Construct {
                     'events:DisableRule',
                 ],
                 resources: [
-                    `arn:aws:events:${props.vpc.region}:*:rule/cryo-${props.environment}-auto-disable`,
-                    `arn:aws:events:${props.vpc.region}:*:rule/cryo-${props.environment}-completion-check`,
+                    `arn:aws:events:${this.region}:*:rule/cryo-${props.environment}-auto-disable`,
+                    `arn:aws:events:${this.region}:*:rule/cryo-${props.environment}-completion-check`,
                     ...rdsListenerRuleArns,
                 ],
             })
@@ -214,7 +267,7 @@ export class Controller extends Construct {
     private addEventBridgePermissions(role: iam.Role, props: ControllerProps): void {
         if (props.resources.rule?.name && props.resources.rule.name.length > 0) {
             const ruleArns = props.resources.rule.name.map(
-                (ruleName) => `arn:aws:events:${props.vpc.region}:*:rule/${ruleName}`
+                (ruleName) => `arn:aws:events:${this.region}:*:rule/${ruleName}`
             );
 
             role.addToPolicy(
@@ -243,11 +296,11 @@ export class Controller extends Construct {
                         'apigateway:PATCH',
                     ],
                     resources: [
-                        `arn:aws:apigateway:${props.vpc.region}::/apis`,
-                        `arn:aws:apigateway:${props.vpc.region}::/apis/*`,
-                        `arn:aws:apigateway:${props.vpc.region}::/domainnames/*`,
-                        `arn:aws:apigateway:${props.vpc.region}::/domainnames/*/apimappings`,
-                        `arn:aws:apigateway:${props.vpc.region}::/domainnames/*/apimappings/*`,
+                        `arn:aws:apigateway:${this.region}::/apis`,
+                        `arn:aws:apigateway:${this.region}::/apis/*`,
+                        `arn:aws:apigateway:${this.region}::/domainnames/*`,
+                        `arn:aws:apigateway:${this.region}::/domainnames/*/apimappings`,
+                        `arn:aws:apigateway:${this.region}::/domainnames/*/apimappings/*`,
                     ],
                 })
             );

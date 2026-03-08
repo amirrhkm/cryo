@@ -1,23 +1,44 @@
-import { EventBridgeClient, EnableRuleCommand, DisableRuleCommand } from '@aws-sdk/client-eventbridge';
-import { LoggerService } from '../logger/logger.service';
+import { Context } from 'aws-lambda';
+import {
+    EventBridgeClient,
+    DescribeRuleCommand,
+    EnableRuleCommand,
+    DisableRuleCommand,
+} from '@aws-sdk/client-eventbridge';
+import { LoggerService } from '../logger';
+import {
+    EVENTBRIDGE_RULE_STATE,
+    EVENTBRIDGE_LOG_MESSAGES,
+    PROMISE_SETTLED_STATUS,
+} from './eventbridge.interface';
 
 export class EventBridgeService {
     private readonly client: EventBridgeClient;
+    private readonly logger: LoggerService;
 
     constructor(
         private readonly ruleNames: string[],
-        private readonly logger: LoggerService
+        context?: Context
     ) {
         this.client = new EventBridgeClient({});
+        this.logger = new LoggerService(context, 'EventBridgeService');
     }
 
-    async enableRules(): Promise<void> {
-        if (this.ruleNames.length === 0) {
-            this.logger.info('[EventBridgeService] No rules to enable');
+    async enableAllRules(): Promise<void> {
+        if (this.hasNoRules()) {
+            this.logger.info(EVENTBRIDGE_LOG_MESSAGES.NO_RULES_ENABLE);
             return;
         }
 
-        this.logger.info('[EventBridgeService] Enabling EventBridge rules', { 
+        const alreadyEnabled = await this.areAllRulesInState(EVENTBRIDGE_RULE_STATE.ENABLED);
+        if (alreadyEnabled) {
+            this.logger.info(EVENTBRIDGE_LOG_MESSAGES.ALREADY_IN_DESIRED_STATE, {
+                desiredState: EVENTBRIDGE_RULE_STATE.ENABLED,
+            });
+            return;
+        }
+
+        this.logger.info(EVENTBRIDGE_LOG_MESSAGES.ENABLING_RULES, { 
             ruleNames: this.ruleNames,
             count: this.ruleNames.length 
         });
@@ -26,9 +47,9 @@ export class EventBridgeService {
             this.ruleNames.map(async (ruleName) => {
                 try {
                     await this.client.send(new EnableRuleCommand({ Name: ruleName }));
-                    this.logger.info('[EventBridgeService] Rule enabled', { ruleName });
+                    this.logger.info(EVENTBRIDGE_LOG_MESSAGES.RULE_ENABLED, { ruleName });
                 } catch (error: any) {
-                    this.logger.error('[EventBridgeService] Failed to enable rule', {
+                    this.logger.error(EVENTBRIDGE_LOG_MESSAGES.FAILED_TO_ENABLE, {
                         ruleName,
                         error: error.message,
                     });
@@ -37,24 +58,34 @@ export class EventBridgeService {
             })
         );
 
-        const failures = results.filter((r) => r.status === 'rejected');
+        const failures = results.filter((r) => r.status === PROMISE_SETTLED_STATUS.REJECTED);
         if (failures.length > 0) {
-            this.logger.warn('[EventBridgeService] Some rules failed to enable', {
+            this.logger.warn(EVENTBRIDGE_LOG_MESSAGES.SOME_RULES_FAILED_ENABLE, {
                 failed: failures.length,
                 total: this.ruleNames.length,
             });
-        } else {
-            this.logger.info('[EventBridgeService] All rules enabled successfully');
+            throw new Error(
+                `${EVENTBRIDGE_LOG_MESSAGES.SOME_RULES_FAILED_ENABLE}: ${failures.length}/${this.ruleNames.length} failed`
+            );
         }
+        this.logger.info(EVENTBRIDGE_LOG_MESSAGES.ALL_RULES_ENABLED);
     }
 
-    async disableRules(): Promise<void> {
-        if (this.ruleNames.length === 0) {
-            this.logger.info('[EventBridgeService] No rules to disable');
+    async disableAllRules(): Promise<void> {
+        if (this.hasNoRules()) {
+            this.logger.info(EVENTBRIDGE_LOG_MESSAGES.NO_RULES_DISABLE);
             return;
         }
 
-        this.logger.info('[EventBridgeService] Disabling EventBridge rules', { 
+        const alreadyDisabled = await this.areAllRulesInState(EVENTBRIDGE_RULE_STATE.DISABLED);
+        if (alreadyDisabled) {
+            this.logger.info(EVENTBRIDGE_LOG_MESSAGES.ALREADY_IN_DESIRED_STATE, {
+                desiredState: EVENTBRIDGE_RULE_STATE.DISABLED,
+            });
+            return;
+        }
+
+        this.logger.info(EVENTBRIDGE_LOG_MESSAGES.DISABLING_RULES, { 
             ruleNames: this.ruleNames,
             count: this.ruleNames.length 
         });
@@ -63,9 +94,9 @@ export class EventBridgeService {
             this.ruleNames.map(async (ruleName) => {
                 try {
                     await this.client.send(new DisableRuleCommand({ Name: ruleName }));
-                    this.logger.info('[EventBridgeService] Rule disabled', { ruleName });
+                    this.logger.info(EVENTBRIDGE_LOG_MESSAGES.RULE_DISABLED, { ruleName });
                 } catch (error: any) {
-                    this.logger.error('[EventBridgeService] Failed to disable rule', {
+                    this.logger.error(EVENTBRIDGE_LOG_MESSAGES.FAILED_TO_DISABLE, {
                         ruleName,
                         error: error.message,
                     });
@@ -74,15 +105,33 @@ export class EventBridgeService {
             })
         );
 
-        const failures = results.filter((r) => r.status === 'rejected');
+        const failures = results.filter((r) => r.status === PROMISE_SETTLED_STATUS.REJECTED);
         if (failures.length > 0) {
-            this.logger.warn('[EventBridgeService] Some rules failed to disable', {
+            this.logger.warn(EVENTBRIDGE_LOG_MESSAGES.SOME_RULES_FAILED_DISABLE, {
                 failed: failures.length,
                 total: this.ruleNames.length,
             });
-        } else {
-            this.logger.info('[EventBridgeService] All rules disabled successfully');
+            throw new Error(
+                `${EVENTBRIDGE_LOG_MESSAGES.SOME_RULES_FAILED_DISABLE}: ${failures.length}/${this.ruleNames.length} failed`
+            );
         }
+        this.logger.info(EVENTBRIDGE_LOG_MESSAGES.ALL_RULES_DISABLED);
+    }
+
+    private hasNoRules(): boolean {
+        return this.ruleNames.length === 0;
+    }
+
+    private async areAllRulesInState(targetState: string): Promise<boolean> {
+        const results = await Promise.allSettled(
+            this.ruleNames.map(async (ruleName) => {
+                const response = await this.client.send(
+                    new DescribeRuleCommand({ Name: ruleName })
+                );
+                return response.State === targetState;
+            })
+        );
+
+        return results.every((r) => r.status === PROMISE_SETTLED_STATUS.FULFILLED && r.value === true);
     }
 }
-

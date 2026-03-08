@@ -4,7 +4,7 @@ import { IStageProps } from "../../interfaces";
 import { applyTags } from "../../utils";
 import { AppStack } from "../../stacks/app.stack";
 
-export class ShellSgUatStage extends Stage {
+export class RonposUatStage extends Stage {
     constructor(scope: Construct, id: string, props: IStageProps) {
         super(scope, id, props);
 

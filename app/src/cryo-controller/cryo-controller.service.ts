@@ -1,4 +1,15 @@
-import { CryoRequest, CryoResponse } from './cryo-controller.interface';
+import { Context } from 'aws-lambda';
+import {
+    CryoRequest,
+    CryoResponse,
+    ENVIRONMENT_STATES,
+    RECONCILE_SOURCES,
+    REQUEST_TYPES,
+    TRANSITIONAL_STATES,
+    RESPONSE_MESSAGE_PREFIX,
+    RESOURCE_READINESS_STATES,
+    CRYO_CONTROLLER_LOG_MESSAGES as LOG,
+} from './cryo-controller.interface';
 import { ConfigService } from '../config/config.service';
 import { LoggerService } from '../logger/logger.service';
 import { StateManagerService } from '../state-manager/state-manager.service';
@@ -20,146 +31,191 @@ export class CryoControllerService {
 
     constructor(
         private readonly config: ConfigService,
-        private readonly logger: LoggerService
+        private readonly logger: LoggerService,
+        private readonly context?: Context
     ) {
         const cryoConfig = this.config.getConfig();
         const retryConfig = this.config.getRetryConfig();
-        
-        this.stateManager = new StateManagerService(logger, config);
-        this.ec2Service = new Ec2Service(cryoConfig.ec2InstanceIds, retryConfig.ec2, logger);
-        this.rdsService = new RdsService(cryoConfig.rdsResources, retryConfig.rds, logger);
-        this.ecsService = new EcsService(cryoConfig.ecsClusters, retryConfig.ecs, this.stateManager, logger);
-        this.eventBridgeService = new EventBridgeService(cryoConfig.ruleNames, logger);
-        this.apiGatewayService = new ApiGatewayService(cryoConfig.apiGateways, logger);
+
+        this.stateManager = new StateManagerService(config, this.context);
+        this.ec2Service = new Ec2Service(cryoConfig.ec2InstanceIds, this.context);
+        this.rdsService = new RdsService(cryoConfig.rdsResources, retryConfig.rds, this.context);
+        this.ecsService = new EcsService(cryoConfig.ecsClusters, this.stateManager, this.context);
+        this.eventBridgeService = new EventBridgeService(cryoConfig.ruleNames, this.context);
+        this.apiGatewayService = new ApiGatewayService(cryoConfig.apiGateways, this.context);
         this.schedulerService = new SchedulerService(
             cryoConfig.autoDisableRuleName,
             cryoConfig.completionCheck.name,
             cryoConfig.rdsListenerRuleNames,
-            logger
+            this.context
         );
     }
 
     async handle(request: CryoRequest): Promise<CryoResponse> {
-        this.logger.info('[CryoControllerService] Handling Cryo request', { type: request.type });
+        this.logger.info(LOG.HANDLING_REQUEST, { type: request.type });
 
         try {
             switch (request.type) {
-                case 'enable':
-                    return await this.handleEnable(request.duration);
-                case 'disable':
+                case REQUEST_TYPES.ENABLE:
+                    return await this.handleEnable(request.durationDays, request.endDateTime);
+                case REQUEST_TYPES.DISABLE:
                     return await this.handleDisable();
-                case 'save':
+                case REQUEST_TYPES.SAVE:
                     return await this.handleSave();
-                case 'reconcile':
+                case REQUEST_TYPES.RECONCILE:
                     return await this.handleReconcile(request.source, request.clusterIdentifier);
                 default:
-                    throw new Error(`Unknown request type: ${(request as any).type}`);
+                    throw new Error(`${LOG.UNKNOWN_REQUEST_TYPE}: ${(request as any).type}`);
             }
         } catch (error: any) {
-            this.logger.error('[CryoControllerService] Cryo request failed', {
+            this.logger.error(LOG.REQUEST_FAILED, {
                 type: request.type,
                 error: error.message,
                 stack: error.stack,
             });
-            return { success: false, message: `[CryoControllerService] ${error.message}` };
+            return { success: false, message: this.formatResponseMessage(error.message) };
         }
     }
 
-    private async handleEnable(durationStr: string): Promise<CryoResponse> {
+    private async handleEnable(durationDays?: string, endDateTime?: string): Promise<CryoResponse> {
         const currentState = await this.stateManager.getState();
-        const duration = Number.parseInt(durationStr, 10);
 
-        if (currentState === 'enabled') {
-            this.logger.info('[CryoControllerService] Environment already enabled, skipping');
-            return { success: true, message: '[CryoControllerService] Environment already enabled' };
+        if (currentState === ENVIRONMENT_STATES.ENABLED) {
+            this.logger.info(LOG.ALREADY_ENABLED);
+            return { success: true, message: this.formatResponseMessage(LOG.ALREADY_ENABLED_MSG) };
         }
 
-        if (currentState === 'enabling') {
-            this.logger.info('[CryoControllerService] Environment already enabling, skipping');
-            return { success: true, message: '[CryoControllerService] Environment is currently enabling' };
+        if (currentState === ENVIRONMENT_STATES.ENABLING) {
+            this.logger.info(LOG.ALREADY_ENABLING);
+            return { success: true, message: this.formatResponseMessage(LOG.ALREADY_ENABLING_MSG) };
         }
 
-        this.logger.info('[CryoControllerService] Enabling environment (fire-and-forget)', { duration: durationStr });
+        this.logger.info(LOG.ENABLING_ENVIRONMENT, { durationDays, endDateTime });
 
-        await this.stateManager.setState('enabling');
+        await this.stateManager.setState(ENVIRONMENT_STATES.ENABLING);
         await this.stateManager.resetCompletionCheckAttempts();
         await this.schedulerService.disableRdsListeners();
 
-        await Promise.all([
-            this.ec2Service.startNoWait(),
-            this.rdsService.startNoWait(),
-            this.ecsService.scaleUpNoWait(),
-            this.eventBridgeService.enableRules(),
-            this.apiGatewayService.enableApiMappings(),
-        ]);
+        try {
+            await Promise.all([
+                this.ec2Service.startAllInstancesWithoutWaiting(),
+                this.rdsService.startAllResourcesWithoutWaiting(),
+                this.ecsService.scaleUpAllServicesWithoutWaiting(),
+                this.eventBridgeService.enableAllRules(),
+                this.apiGatewayService.enableAllApiMappings(),
+            ]);
 
-        await this.schedulerService.enableCompletionCheck();
-        await this.schedulerService.scheduleDisable(duration);
+            await this.schedulerService.enableCompletionCheck();
 
-        this.logger.info('[CryoControllerService] Enable commands issued, completion check enabled', { duration });
+            if (endDateTime) {
+                const parsedDate = new Date(endDateTime);
+                if (!Number.isFinite(parsedDate.getTime())) {
+                    throw new Error(`${LOG.INVALID_SCHEDULE}: invalid endDateTime format: ${endDateTime}`);
+                }
+                await this.schedulerService.scheduleDisable(undefined, endDateTime);
+            } else if (durationDays) {
+                const duration = Number.parseInt(durationDays, 10);
+                if (!Number.isFinite(duration) || duration <= 0) {
+                    throw new Error(`${LOG.INVALID_SCHEDULE}: durationDays must be a positive integer, got: ${durationDays}`);
+                }
+                await this.schedulerService.scheduleDisable(duration);
+            }
+        } catch (error: any) {
+            await this.stateManager.setState(ENVIRONMENT_STATES.DISABLED);
+            await this.schedulerService.enableRdsListeners();
+            await this.schedulerService.disableCompletionCheck();
+            await this.stateManager.resetCompletionCheckAttempts();
+            throw error;
+        }
+
+        this.logger.info(LOG.ENABLE_COMMANDS_ISSUED, { durationDays, endDateTime });
         return {
             success: true,
-            message: `[CryoControllerService] Environment enable initiated for ${duration} days. Check in progress.`,
+            message: this.formatResponseMessage(
+                `${LOG.ENABLE_INITIATED} ${this.buildScheduleInfo(durationDays, endDateTime)}. Check in progress.`
+            ),
         };
     }
 
     private async handleDisable(): Promise<CryoResponse> {
         const currentState = await this.stateManager.getState();
 
-        if (currentState === 'disabled') {
-            this.logger.info('[CryoControllerService] Environment already disabled, skipping');
-            return { success: true, message: '[CryoControllerService] Environment already disabled' };
+        if (currentState === ENVIRONMENT_STATES.DISABLED) {
+            this.logger.info(LOG.ALREADY_DISABLED);
+            return { success: true, message: this.formatResponseMessage(LOG.ALREADY_DISABLED_MSG) };
         }
 
-        if (currentState === 'disabling') {
-            this.logger.info('[CryoControllerService] Environment already disabling, skipping');
-            return { success: true, message: '[CryoControllerService] Environment is currently disabling' };
+        if (currentState === ENVIRONMENT_STATES.DISABLING) {
+            this.logger.info(LOG.ALREADY_DISABLING);
+            return { success: true, message: this.formatResponseMessage(LOG.ALREADY_DISABLING_MSG) };
         }
 
-        this.logger.info('[CryoControllerService] Disabling environment (fire-and-forget)');
+        if (currentState === ENVIRONMENT_STATES.ENABLING) {
+            this.logger.info(LOG.CANNOT_DISABLE_WHILE_ENABLING);
+            return { success: false, message: this.formatResponseMessage(LOG.CANNOT_DISABLE_WHILE_ENABLING_MSG) };
+        }
 
-        await this.stateManager.setState('disabling');
+        this.logger.info(LOG.DISABLING_ENVIRONMENT);
+
+        await this.stateManager.setState(ENVIRONMENT_STATES.DISABLING);
         await this.stateManager.resetCompletionCheckAttempts();
         await this.schedulerService.enableRdsListeners();
 
-        await Promise.all([
-            this.ecsService.scaleDownNoWait(),
-            this.ec2Service.stopNoWait(),
-            this.rdsService.stopNoWait(),
-            this.eventBridgeService.disableRules(),
-            this.apiGatewayService.disableApiMappings(),
-        ]);
+        try {
+            await Promise.all([
+                this.ecsService.scaleDownAllServicesWithoutWaiting(),
+                this.ec2Service.stopAllInstancesWithoutWaiting(),
+                this.rdsService.stopAllResourcesWithoutWaiting(),
+                this.eventBridgeService.disableAllRules(),
+                this.apiGatewayService.disableAllApiMappings(),
+            ]);
 
-        await this.schedulerService.enableCompletionCheck();
-        await this.schedulerService.disableScheduler();
+            await this.schedulerService.enableCompletionCheck();
+            await this.schedulerService.disableScheduler();
+        } catch (error: any) {
+            await this.stateManager.setState(ENVIRONMENT_STATES.ENABLED);
+            await this.schedulerService.disableRdsListeners();
+            await this.schedulerService.disableCompletionCheck();
+            await this.stateManager.resetCompletionCheckAttempts();
+            throw error;
+        }
 
-        this.logger.info('[CryoControllerService] Disable commands issued, completion check enabled');
-        return { success: true, message: '[CryoControllerService] Environment disable initiated. Check in progress.' };
+        this.logger.info(LOG.DISABLE_COMMANDS_ISSUED);
+        return { success: true, message: this.formatResponseMessage(LOG.DISABLE_INITIATED) };
     }
 
     private async handleSave(): Promise<CryoResponse> {
-        this.logger.info('[CryoControllerService] Saving ECS desired counts');
+        const currentState = await this.stateManager.getState();
+
+        if (currentState === ENVIRONMENT_STATES.DISABLED) {
+            this.logger.warn(LOG.CANNOT_SAVE_WHEN_DISABLED);
+            return {
+                success: false,
+                message: this.formatResponseMessage(LOG.CANNOT_SAVE_WHEN_DISABLED_MSG),
+            };
+        }
+
+        this.logger.info(LOG.SAVING_ECS_COUNTS);
         await this.ecsService.saveDesiredCounts();
-        this.logger.info('[CryoControllerService] ECS desired counts saved successfully');
-        return { success: true, message: '[CryoControllerService] ECS desired counts saved' };
+        this.logger.info(LOG.ECS_COUNTS_SAVED);
+        return { success: true, message: this.formatResponseMessage(LOG.ECS_COUNTS_SAVED_MSG) };
     }
 
     private async handleCompletionCheck(currentState: string): Promise<CryoResponse> {
-        const transitionalStates = ['enabling', 'disabling'];
         const completionCheckConfig = this.config.getConfig().completionCheck;
         const maxAttempts = completionCheckConfig.maxAttempts;
         const delayMinutes = completionCheckConfig.delayMinutes;
 
-        if (!transitionalStates.includes(currentState)) {
-            this.logger.info('[CryoControllerService] Not in transitional state, disabling completion check', { currentState });
+        if (!TRANSITIONAL_STATES.includes(currentState as any)) {
+            this.logger.info(LOG.NOT_IN_TRANSITIONAL_STATE, { currentState });
             await this.schedulerService.disableCompletionCheck();
-            return { success: true, message: '[CryoControllerService] Already completed, check disabled' };
+            return { success: true, message: this.formatResponseMessage(LOG.ALREADY_COMPLETED) };
         }
 
         const attempts = await this.stateManager.getCompletionCheckAttempts();
 
         if (attempts >= maxAttempts) {
-            this.logger.error('[CryoControllerService] Operation timed out after max attempts', {
+            this.logger.error(LOG.OPERATION_TIMED_OUT, {
                 attempts,
                 maxAttempts,
                 currentState,
@@ -168,15 +224,17 @@ export class CryoControllerService {
             await this.stateManager.resetCompletionCheckAttempts();
             return {
                 success: false,
-                message: `[CryoControllerService] Operation timed out after ${maxAttempts * delayMinutes} minutes`,
+                message: this.formatResponseMessage(
+                    `${LOG.OPERATION_TIMED_OUT_MSG} ${maxAttempts * delayMinutes} ${LOG.MINUTES}`
+                ),
             };
         }
 
         await this.stateManager.incrementCompletionCheckAttempts();
 
-        const desiredState = currentState === 'enabling' ? 'enabled' : 'disabled';
+        const desiredState = currentState === ENVIRONMENT_STATES.ENABLING ? ENVIRONMENT_STATES.ENABLED : ENVIRONMENT_STATES.DISABLED;
 
-        this.logger.info('[CryoControllerService] Checking completion', {
+        this.logger.info(LOG.CHECKING_COMPLETION, {
             currentState,
             desiredState,
             attempt: attempts + 1,
@@ -186,9 +244,7 @@ export class CryoControllerService {
         const allReady = await this.checkAllResourcesReady(currentState);
 
         if (allReady) {
-            this.logger.info('[CryoControllerService] All resources ready, operation complete', {
-                finalState: desiredState,
-            });
+            this.logger.info(LOG.ALL_RESOURCES_READY, { finalState: desiredState });
 
             await this.stateManager.setState(desiredState);
             await this.schedulerService.disableCompletionCheck();
@@ -196,122 +252,139 @@ export class CryoControllerService {
 
             return {
                 success: true,
-                message: `[CryoControllerService] Environment ${desiredState} successfully`,
+                message: this.formatResponseMessage(
+                    `${LOG.ENVIRONMENT_STATE_SUCCESS} ${desiredState} ${LOG.SUCCESSFULLY}`
+                ),
             };
         }
 
-        this.logger.info(`[CryoControllerService] Resources not ready yet, will check again in ${delayMinutes} minutes`, {
+        this.logger.info(`${LOG.RESOURCES_NOT_READY} ${delayMinutes} ${LOG.MINUTES}`, {
             attempt: attempts + 1,
             maxAttempts,
         });
 
         return {
             success: true,
-            message: `[CryoControllerService] Still in progress (attempt ${attempts + 1}/${maxAttempts})`,
+            message: this.formatResponseMessage(`${LOG.STILL_IN_PROGRESS} ${attempts + 1}/${maxAttempts})`),
         };
     }
 
     private async checkAllResourcesReady(currentState: string): Promise<boolean> {
-        if (currentState === 'enabling') {
-            const [ec2Ready, rdsReady, ecsReady] = await Promise.all([
-                this.ec2Service.checkAllInState('running'),
-                this.rdsService.checkAllInState('available'),
-                this.ecsService.checkAllServicesStable('up'),
-            ]);
+        const states =
+            currentState === ENVIRONMENT_STATES.ENABLING
+                ? RESOURCE_READINESS_STATES.ENABLING
+                : RESOURCE_READINESS_STATES.DISABLING;
 
-            this.logger.info('[CryoControllerService] Resource readiness check (enabling)', {
-                ec2Ready,
-                rdsReady,
-                ecsReady,
-            });
+        const [ec2Ready, rdsReady, ecsReady] = await Promise.all([
+            this.ec2Service.verifyAllInstancesInState(states.ec2),
+            this.rdsService.verifyAllResourcesInState(states.rds),
+            this.ecsService.verifyAllServicesStable(states.ecs),
+        ]);
 
-            return ec2Ready && rdsReady && ecsReady;
-        } else {
-            const [ec2Ready, rdsReady, ecsReady] = await Promise.all([
-                this.ec2Service.checkAllInState('stopped'),
-                this.rdsService.checkAllInState('stopped'),
-                this.ecsService.checkAllServicesStable('down'),
-            ]);
+        this.logger.info(
+            currentState === ENVIRONMENT_STATES.ENABLING
+                ? LOG.RESOURCE_READINESS_ENABLING
+                : LOG.RESOURCE_READINESS_DISABLING,
+            { ec2Ready, rdsReady, ecsReady }
+        );
 
-            this.logger.info('[CryoControllerService] Resource readiness check (disabling)', {
-                ec2Ready,
-                rdsReady,
-                ecsReady,
-            });
-
-            return ec2Ready && rdsReady && ecsReady;
-        }
+        return ec2Ready && rdsReady && ecsReady;
     }
 
     private async handleReconcile(source?: string, clusterIdentifier?: string): Promise<CryoResponse> {
-        const isRdsAutoRestart = source === 'rds-auto-restart';
-        const isCompletionCheck = source === 'completion-check';
+        const isRdsAutoRestart = source === RECONCILE_SOURCES.RDS_AUTO_RESTART;
+        const isCompletionCheck = source === RECONCILE_SOURCES.COMPLETION_CHECK;
         const desiredState = await this.stateManager.getState();
-        const transitionalStates = ['enabling', 'disabling'];
 
-        this.logger.info('[CryoControllerService] Reconciling environment', { desiredState, source, clusterIdentifier });
+        this.logger.info(LOG.RECONCILING_ENVIRONMENT, { desiredState, source, clusterIdentifier });
 
         if (isCompletionCheck) {
             return await this.handleCompletionCheck(desiredState);
         }
+
+        if (isRdsAutoRestart && !clusterIdentifier) {
+            this.logger.error(LOG.RDS_MISSING_CLUSTER_IDENTIFIER);
+            return {
+                success: false,
+                message: this.formatResponseMessage(LOG.RDS_MISSING_CLUSTER_IDENTIFIER),
+            };
+        }
         
-        if (transitionalStates.includes(desiredState)) {
-            this.logger.info('[CryoControllerService] Environment in transitional state, skipping reconciliation', {
-                state: desiredState,
-            });
+        if (TRANSITIONAL_STATES.includes(desiredState as any)) {
+            this.logger.info(LOG.IN_TRANSITIONAL_STATE_SKIP, { state: desiredState });
             return {
                 success: true,
-                message: `[CryoControllerService] Environment is ${desiredState}, reconciliation skipped`,
+                message: this.formatResponseMessage(
+                    `${LOG.RECONCILIATION_SKIPPED} ${desiredState}, ${LOG.RECONCILIATION_SKIPPED_MSG}`
+                ),
             };
         }
 
         if (isRdsAutoRestart && clusterIdentifier) {
-            if (desiredState === 'enabled') {
-                this.logger.info('[CryoControllerService] Desired state is enabled, skipping RDS cluster reconciliation', {
-                    clusterIdentifier,
-                });
+            if (desiredState === ENVIRONMENT_STATES.ENABLED) {
+                this.logger.info(LOG.RDS_DESIRED_ENABLED_SKIP, { clusterIdentifier });
                 return {
                     success: true,
-                    message: `[CryoControllerService] Environment is enabled, cluster ${clusterIdentifier} reconciliation skipped`,
+                    message: this.formatResponseMessage(
+                        `${LOG.RDS_ENABLED_SKIP_MSG} ${clusterIdentifier} ${LOG.RECONCILIATION_SKIPPED_MSG}`
+                    ),
                 };
             }
 
-            this.logger.info('[CryoControllerService] Reconciling single RDS cluster (auto-restart mode)', {
+            this.logger.info(LOG.RECONCILING_SINGLE_RDS, { clusterIdentifier });
+            await this.rdsService.reconcileSingleClusterToDesiredState(
                 clusterIdentifier,
-            });
-            await this.rdsService.reconcileSingleCluster(clusterIdentifier, 'stopped', true);
+                RESOURCE_READINESS_STATES.DISABLING.rds,
+                true
+            );
 
             return {
                 success: true,
-                message: `[CryoControllerService] RDS cluster ${clusterIdentifier} reconciled (auto-restart)`,
+                message: this.formatResponseMessage(
+                    `${LOG.RDS_RECONCILED} ${clusterIdentifier} ${LOG.RDS_RECONCILED_MSG}`
+                ),
             };
         }
 
-        if (desiredState === 'enabled') {
-            this.logger.info('[CryoControllerService] Reconciling to enabled state');
+        if (desiredState === ENVIRONMENT_STATES.ENABLED) {
+            const states = RESOURCE_READINESS_STATES.ENABLING;
+            this.logger.info(LOG.RECONCILING_TO_ENABLED);
             await Promise.all([
-                this.ec2Service.reconcile('running'),
-                this.rdsService.reconcile('available', false),
-                this.ecsService.reconcile('up'),
-                this.eventBridgeService.enableRules(),
-                this.apiGatewayService.enableApiMappings(),
-            ]);
-        } else {
-            this.logger.info('[CryoControllerService] Reconciling to disabled state');
-            await Promise.all([
-                this.ecsService.reconcile('down'),
-                this.ec2Service.reconcile('stopped'),
-                this.rdsService.reconcile('stopped', false),
-                this.eventBridgeService.disableRules(),
-                this.apiGatewayService.disableApiMappings(),
+                this.ec2Service.reconcileToDesiredState(states.ec2),
+                this.rdsService.reconcileToDesiredState(states.rds, false),
+                this.ecsService.reconcileToDesiredState(states.ecs),
+                this.eventBridgeService.enableAllRules(),
+                this.apiGatewayService.enableAllApiMappings(),
             ]);
         }
 
-        this.logger.info('[CryoControllerService] Environment reconciled successfully', { desiredState });
+        if (desiredState === ENVIRONMENT_STATES.DISABLED) {
+            const states = RESOURCE_READINESS_STATES.DISABLING;
+            this.logger.info(LOG.RECONCILING_TO_DISABLED);
+            await Promise.all([
+                this.ecsService.reconcileToDesiredState(states.ecs),
+                this.ec2Service.reconcileToDesiredState(states.ec2),
+                this.rdsService.reconcileToDesiredState(states.rds, false),
+                this.eventBridgeService.disableAllRules(),
+                this.apiGatewayService.disableAllApiMappings(),
+            ]);
+        }
+
+        this.logger.info(LOG.RECONCILED_SUCCESSFULLY, { desiredState });
         return {
             success: true,
-            message: `[CryoControllerService] Environment reconciled to ${desiredState} state`,
+            message: this.formatResponseMessage(`${LOG.RECONCILED_TO_STATE} ${desiredState} ${LOG.STATE}`),
         };
+    }
+
+    private formatResponseMessage(text: string): string {
+        return `${RESPONSE_MESSAGE_PREFIX} ${text}`;
+    }
+
+    private buildScheduleInfo(durationDays?: string, endDateTime?: string): string {
+        if (endDateTime) return `${LOG.UNTIL} ${endDateTime}`;
+        if (durationDays) return `${LOG.FOR_DAYS} ${durationDays} ${LOG.DAYS}`;
+        return LOG.WITHOUT_AUTO_DISABLE;
     }
 }
 

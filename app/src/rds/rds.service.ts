@@ -1,3 +1,4 @@
+import { Context } from 'aws-lambda';
 import {
     RDSClient,
     DescribeDBClustersCommand,
@@ -7,165 +8,80 @@ import {
     StartDBInstanceCommand,
     StopDBInstanceCommand,
 } from '@aws-sdk/client-rds';
-import { LoggerService } from '../logger/logger.service';
-import { IRdsResource } from './rds.interface';
+import { LoggerService } from '../logger';
+import { 
+    IRdsResource, 
+    IRdsResourceState,
+    RdsResourceState,
+    RDS_ERROR_CODES,
+    RDS_LOG_MESSAGES as LOG,
+    RDS_RESOURCE_TYPES,
+    RDS_RESOURCE_STATES,
+} from './rds.interface';
 import { IRetryConfig } from '../config/retry.config';
 
 export class RdsService {
+    private static readonly SERVICE_NAME = 'RdsService';
+    private static readonly INVALID_STATE_ERROR_CODES = [
+        RDS_ERROR_CODES.INVALID_CLUSTER_STATE,
+        RDS_ERROR_CODES.INVALID_INSTANCE_STATE,
+    ];
+
     private readonly rdsClient: RDSClient;
+    private readonly logger: LoggerService;
 
     constructor(
         private readonly rdsResources: IRdsResource[],
         private readonly retryConfig: IRetryConfig['rds'],
-        private readonly logger: LoggerService
+        context?: Context
     ) {
         this.rdsClient = new RDSClient({});
+        this.logger = new LoggerService(context, 'RdsService');
     }
 
-    async start(): Promise<void> {
-        if (this.rdsResources.length === 0) {
-            this.logger.info('[RdsService] No RDS resources to start');
+    async startAllResourcesWithoutWaiting(): Promise<void> {
+        if (this.hasNoResources()) {
+            this.logger.info(LOG.NO_RESOURCES_START);
             return;
         }
 
-        this.logger.info('[RdsService] Starting RDS resources', {
+        this.logger.info(LOG.STARTING_RESOURCES, {
             resources: this.rdsResources,
         });
 
         for (const resource of this.rdsResources) {
-            try {
-                if (resource.type === 'cluster') {
-                    await this.rdsClient.send(
-                        new StartDBClusterCommand({ DBClusterIdentifier: resource.identifier })
-                    );
-                    this.logger.info('[RdsService] Started RDS cluster', { identifier: resource.identifier });
-                } else {
-                    await this.rdsClient.send(
-                        new StartDBInstanceCommand({ DBInstanceIdentifier: resource.identifier })
-                    );
-                    this.logger.info('[RdsService] Started RDS instance', { identifier: resource.identifier });
-                }
-            } catch (error: any) {
-                const invalidStateFaults = ['InvalidDBClusterStateFault', 'InvalidDBInstanceState'];
-                if (invalidStateFaults.includes(error.name)) {
-                    this.logger.warn('[RdsService] RDS resource already starting or available', {
-                        identifier: resource.identifier,
-                        type: resource.type,
-                    });
-                } else {
-                    throw error;
-                }
-            }
+            await this.startSingleResourceIgnoringTransitionalState(resource);
         }
 
-        await this.waitForState('available');
-        this.logger.info('[RdsService] All RDS resources are available');
+        this.logger.info(LOG.START_COMMANDS_ISSUED);
     }
 
-    async stop(retryOnTransitional = false): Promise<void> {
-        if (this.rdsResources.length === 0) {
-            this.logger.info('[RdsService] No RDS resources to stop');
+    async stopAllResourcesWithoutWaiting(): Promise<void> {
+        if (this.hasNoResources()) {
+            this.logger.info(LOG.NO_RESOURCES_STOP);
             return;
         }
 
-        this.logger.info('[RdsService] Stopping RDS resources', {
-            resources: this.rdsResources,
-            retryOnTransitional,
-        });
-
-        for (const resource of this.rdsResources) {
-            await this.stopResourceWithRetry(resource, retryOnTransitional);
-        }
-
-        await this.waitForState('stopped');
-        this.logger.info('[RdsService] All RDS resources are stopped');
-    }
-
-    async startNoWait(): Promise<void> {
-        if (this.rdsResources.length === 0) {
-            this.logger.info('[RdsService] No RDS resources to start (no-wait)');
-            return;
-        }
-
-        this.logger.info('[RdsService] Starting RDS resources (no-wait)', {
+        this.logger.info(LOG.STOPPING_RESOURCES, {
             resources: this.rdsResources,
         });
 
         for (const resource of this.rdsResources) {
-            try {
-                if (resource.type === 'cluster') {
-                    await this.rdsClient.send(
-                        new StartDBClusterCommand({ DBClusterIdentifier: resource.identifier })
-                    );
-                } else {
-                    await this.rdsClient.send(
-                        new StartDBInstanceCommand({ DBInstanceIdentifier: resource.identifier })
-                    );
-                }
-                this.logger.info('[RdsService] Started RDS resource (no-wait)', { identifier: resource.identifier, type: resource.type });
-            } catch (error: any) {
-                const invalidStateFaults = ['InvalidDBClusterStateFault', 'InvalidDBInstanceStateFault'];
-                if (invalidStateFaults.includes(error.name)) {
-                    this.logger.warn('[RdsService] RDS resource already starting or available', {
-                        identifier: resource.identifier,
-                        type: resource.type,
-                    });
-                } else {
-                    throw error;
-                }
-            }
+            await this.stopSingleResourceIgnoringTransitionalState(resource);
         }
 
-        this.logger.info('[RdsService] Start commands issued for all RDS resources');
+        this.logger.info(LOG.STOP_COMMANDS_ISSUED);
     }
 
-    async stopNoWait(): Promise<void> {
-        if (this.rdsResources.length === 0) {
-            this.logger.info('[RdsService] No RDS resources to stop (no-wait)');
-            return;
-        }
-
-        this.logger.info('[RdsService] Stopping RDS resources (no-wait)', {
-            resources: this.rdsResources,
-        });
-
-        for (const resource of this.rdsResources) {
-            try {
-                if (resource.type === 'cluster') {
-                    await this.rdsClient.send(
-                        new StopDBClusterCommand({ DBClusterIdentifier: resource.identifier })
-                    );
-                } else {
-                    await this.rdsClient.send(
-                        new StopDBInstanceCommand({ DBInstanceIdentifier: resource.identifier })
-                    );
-                }
-                this.logger.info('[RdsService] Stopped RDS resource (no-wait)', { identifier: resource.identifier, type: resource.type });
-            } catch (error: any) {
-                const invalidStateFaults = ['InvalidDBClusterStateFault', 'InvalidDBInstanceStateFault'];
-                if (invalidStateFaults.includes(error.name)) {
-                    this.logger.warn('[RdsService] RDS resource already stopping or stopped', {
-                        identifier: resource.identifier,
-                        type: resource.type,
-                    });
-                } else {
-                    throw error;
-                }
-            }
-        }
-
-        this.logger.info('[RdsService] Stop commands issued for all RDS resources');
-    }
-
-    async checkAllInState(targetState: string): Promise<boolean> {
-        if (this.rdsResources.length === 0) {
+    async verifyAllResourcesInState(targetState: string): Promise<boolean> {
+        if (this.hasNoResources()) {
             return true;
         }
 
-        const resourceStates = await this.getResourceStates();
+        const resourceStates = await this.fetchAllResourceStates();
         const allInState = resourceStates.every((rs) => rs.state === targetState);
 
-        this.logger.info('[RdsService] Checked RDS resource states', {
+        this.logger.info(LOG.CHECKED_STATES, {
             targetState,
             allInState,
             resources: resourceStates,
@@ -174,63 +90,64 @@ export class RdsService {
         return allInState;
     }
 
-    async reconcile(desiredState: 'available' | 'stopped', isRdsAutoRestart = false): Promise<void> {
-        if (this.rdsResources.length === 0) {
-            this.logger.info('[RdsService] No RDS resources to reconcile');
+    async reconcileToDesiredState(desiredState: RdsResourceState, isRdsAutoRestart = false): Promise<void> {
+        if (this.hasNoResources()) {
+            this.logger.info(LOG.NO_RESOURCES_RECONCILE);
             return;
         }
 
-        const resourceStates = await this.getResourceStates();
+        const resourceStates = await this.fetchAllResourceStates();
         const needsAction = resourceStates.some((rs) => rs.state !== desiredState);
 
         if (!needsAction) {
-            this.logger.info('[RdsService] RDS resources already in desired state', {
+            this.logger.info(LOG.ALREADY_IN_DESIRED_STATE, {
                 desiredState,
                 resources: resourceStates,
             });
             return;
         }
 
-        this.logger.info('[RdsService] RDS resources need reconciliation', {
+        this.logger.info(LOG.NEEDS_RECONCILIATION, {
             desiredState,
             resources: resourceStates,
         });
 
-        if (desiredState === 'available') {
-            await this.start();
+        if (desiredState === RDS_RESOURCE_STATES.AVAILABLE) {
+            await this.startAllResources();
         } else {
-            await this.stop(isRdsAutoRestart);
+            await this.stopAllResourcesWithRetry(isRdsAutoRestart);
         }
+
+        this.logger.info(LOG.RECONCILE_COMMANDS_ISSUED);
     }
 
-    async reconcileSingleCluster(
+    async reconcileSingleClusterToDesiredState(
         clusterIdentifier: string,
-        desiredState: 'available' | 'stopped',
+        desiredState: RdsResourceState,
         isRdsAutoRestart = false
     ): Promise<void> {
-        const resource = this.rdsResources.find(
-            r => r.identifier === clusterIdentifier && r.type === 'cluster'
-        );
+        const resource = this.findClusterResource(clusterIdentifier);
 
         if (!resource) {
-            this.logger.warn('[RdsService] RDS cluster not found in configuration', { clusterIdentifier });
+            this.logger.warn(LOG.CLUSTER_NOT_FOUND, { clusterIdentifier });
             return;
         }
 
-        this.logger.info('[RdsService] Reconciling single RDS cluster', {
+        this.logger.info(LOG.RECONCILING_SINGLE_CLUSTER, {
             clusterIdentifier,
             desiredState,
             isRdsAutoRestart,
         });
 
-        const describeResponse = await this.rdsClient.send(
-            new DescribeDBClustersCommand({ DBClusterIdentifier: clusterIdentifier })
-        );
-        const cluster = describeResponse.DBClusters?.[0];
-        const currentState = cluster?.Status;
+        const currentState = await this.fetchClusterCurrentState(clusterIdentifier);
+
+        if (currentState === undefined) {
+            this.logger.error(LOG.CLUSTER_STATE_UNKNOWN, { clusterIdentifier });
+            throw new Error(`${LOG.CLUSTER_STATE_UNKNOWN}: ${clusterIdentifier}`);
+        }
 
         if (currentState === desiredState) {
-            this.logger.info('[RdsService] RDS cluster already in desired state', {
+            this.logger.info(LOG.CLUSTER_ALREADY_IN_STATE, {
                 clusterIdentifier,
                 currentState,
                 desiredState,
@@ -238,32 +155,105 @@ export class RdsService {
             return;
         }
 
-        this.logger.info('[RdsService] RDS cluster needs reconciliation', {
+        this.logger.info(LOG.CLUSTER_NEEDS_RECONCILIATION, {
             clusterIdentifier,
             currentState,
             desiredState,
         });
 
-        if (desiredState === 'available') {
-            try {
-                await this.rdsClient.send(
-                    new StartDBClusterCommand({ DBClusterIdentifier: clusterIdentifier })
-                );
-                this.logger.info('[RdsService] Started RDS cluster', { clusterIdentifier });
-            } catch (error: any) {
-                if (error.name === 'InvalidDBClusterStateFault') {
-                    this.logger.warn('[RdsService] RDS cluster already starting or available', { clusterIdentifier });
-                } else {
-                    throw error;
-                }
-            }
+        if (desiredState === RDS_RESOURCE_STATES.AVAILABLE) {
+            await this.startClusterIgnoringTransitionalState(clusterIdentifier);
         } else {
-            await this.stopResourceWithRetry(resource, isRdsAutoRestart);
-            this.logger.info('[RdsService] Stopped RDS cluster', { clusterIdentifier });
+            await this.stopResourceWithRetryStrategy(resource, isRdsAutoRestart);
+            this.logger.info(LOG.STOPPED_CLUSTER, { clusterIdentifier });
         }
     }
 
-    private async stopResourceWithRetry(
+    private async startAllResources(): Promise<void> {
+        for (const resource of this.rdsResources) {
+            await this.startResourceAndLogResult(resource);
+        }
+    }
+
+    private async stopAllResourcesWithRetry(isRdsAutoRestart: boolean): Promise<void> {
+        for (const resource of this.rdsResources) {
+            await this.stopResourceWithRetryStrategy(resource, isRdsAutoRestart);
+        }
+    }
+
+    private async startSingleResourceIgnoringTransitionalState(resource: IRdsResource): Promise<void> {
+        try {
+            await this.executeStartCommand(resource);
+            this.logger.info(LOG.STARTED_RESOURCE, { 
+                identifier: resource.identifier, 
+                type: resource.type 
+            });
+        } catch (error: any) {
+            if (this.isInvalidStateError(error)) {
+                this.logger.warn(LOG.ALREADY_STARTING, {
+                    identifier: resource.identifier,
+                    type: resource.type,
+                });
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    private async stopSingleResourceIgnoringTransitionalState(resource: IRdsResource): Promise<void> {
+        try {
+            await this.executeStopCommand(resource);
+            this.logger.info(LOG.STOPPED_RESOURCE, { 
+                identifier: resource.identifier, 
+                type: resource.type 
+            });
+        } catch (error: any) {
+            if (this.isInvalidStateError(error)) {
+                this.logger.warn(LOG.ALREADY_STOPPING, {
+                    identifier: resource.identifier,
+                    type: resource.type,
+                });
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    private async startResourceAndLogResult(resource: IRdsResource): Promise<void> {
+        try {
+            await this.executeStartCommand(resource);
+            const logMessage = resource.type === RDS_RESOURCE_TYPES.CLUSTER
+                ? LOG.STARTED_CLUSTER 
+                : LOG.STARTED_INSTANCE;
+            this.logger.info(logMessage, { identifier: resource.identifier });
+        } catch (error: any) {
+            if (this.isInvalidStateError(error)) {
+                this.logger.warn(LOG.ALREADY_STARTING, {
+                    identifier: resource.identifier,
+                    type: resource.type,
+                });
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    private async startClusterIgnoringTransitionalState(clusterIdentifier: string): Promise<void> {
+        try {
+            await this.rdsClient.send(
+                new StartDBClusterCommand({ DBClusterIdentifier: clusterIdentifier })
+            );
+            this.logger.info(LOG.STARTED_CLUSTER, { clusterIdentifier });
+        } catch (error: any) {
+            if (error.name === RDS_ERROR_CODES.INVALID_CLUSTER_STATE) {
+                this.logger.warn(LOG.ALREADY_STARTING, { clusterIdentifier });
+            } else {
+                throw error;
+            }
+        }
+    }
+
+    private async stopResourceWithRetryStrategy(
         resource: IRdsResource,
         retryOnTransitional: boolean
     ): Promise<void> {
@@ -273,37 +263,28 @@ export class RdsService {
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                if (resource.type === 'cluster') {
-                    await this.rdsClient.send(
-                        new StopDBClusterCommand({ DBClusterIdentifier: resource.identifier })
-                    );
-                } else {
-                    await this.rdsClient.send(
-                        new StopDBInstanceCommand({ DBInstanceIdentifier: resource.identifier })
-                    );
-                }
-                this.logger.info('[RdsService] Stopped RDS resource', {
+                await this.executeStopCommand(resource);
+                this.logger.info(LOG.STOPPED_WITH_RETRY, {
                     identifier: resource.identifier,
                     type: resource.type,
                     attempt,
                 });
                 return;
             } catch (error: any) {
-                const invalidStateFaults = ['InvalidDBClusterStateFault', 'InvalidDBInstanceState'];
-                    if (invalidStateFaults.includes(error.name)) {
-                        if (retryOnTransitional) {
-                            const delayMs = initialDelayMs * Math.min(attempt, backoffCap);
-                        this.logger.warn('[RdsService] RDS resource in transitional state, retrying', {
+                if (this.isInvalidStateError(error)) {
+                    if (retryOnTransitional) {
+                        const delayMs = initialDelayMs * Math.min(attempt, backoffCap);
+                        this.logger.warn(LOG.IN_TRANSITIONAL_STATE, {
                             identifier: resource.identifier,
                             type: resource.type,
                             attempt,
                             maxAttempts,
                             delayMs,
                         });
-                        await new Promise((resolve) => setTimeout(resolve, delayMs));
+                        await this.delay(delayMs);
                         continue;
                     } else {
-                        this.logger.warn('[RdsService] RDS resource already stopping or stopped', {
+                        this.logger.warn(LOG.ALREADY_STOPPING, {
                             identifier: resource.identifier,
                             type: resource.type,
                         });
@@ -315,81 +296,118 @@ export class RdsService {
         }
 
         throw new Error(
-            `[RdsService] Failed to stop RDS ${resource.type} ${resource.identifier} after ${maxAttempts} attempts`
+            `[${RdsService.SERVICE_NAME}] ${LOG.FAILED_TO_STOP} ${resource.type} ${resource.identifier} after ${maxAttempts} attempts`
         );
     }
 
-    private async getResourceStates(): Promise<Array<{ identifier: string; type: string; state: string }>> {
-        const states: Array<{ identifier: string; type: string; state: string }> = [];
+    private async executeStartCommand(resource: IRdsResource): Promise<void> {
+        if (resource.type === RDS_RESOURCE_TYPES.CLUSTER) {
+            await this.rdsClient.send(
+                new StartDBClusterCommand({ DBClusterIdentifier: resource.identifier })
+            );
+        } else {
+            await this.rdsClient.send(
+                new StartDBInstanceCommand({ DBInstanceIdentifier: resource.identifier })
+            );
+        }
+    }
+
+    private async executeStopCommand(resource: IRdsResource): Promise<void> {
+        if (resource.type === RDS_RESOURCE_TYPES.CLUSTER) {
+            await this.rdsClient.send(
+                new StopDBClusterCommand({ DBClusterIdentifier: resource.identifier })
+            );
+        } else {
+            await this.rdsClient.send(
+                new StopDBInstanceCommand({ DBInstanceIdentifier: resource.identifier })
+            );
+        }
+    }
+
+    private async fetchAllResourceStates(): Promise<IRdsResourceState[]> {
+        const states: IRdsResourceState[] = [];
 
         for (const resource of this.rdsResources) {
-            if (resource.type === 'cluster') {
-                const response = await this.rdsClient.send(
-                    new DescribeDBClustersCommand({
-                        DBClusterIdentifier: resource.identifier,
-                    })
+            const state = await this.fetchSingleResourceState(resource);
+            if (state == null) {
+                throw new Error(
+                    `${LOG.CLUSTER_STATE_UNKNOWN}: could not fetch state for resource ${resource.identifier} (${resource.type})`
                 );
-                const cluster = response.DBClusters?.[0];
-                if (cluster?.Status) {
-                    states.push({
-                        identifier: resource.identifier,
-                        type: resource.type,
-                        state: cluster.Status,
-                    });
-                }
-            } else {
-                const response = await this.rdsClient.send(
-                    new DescribeDBInstancesCommand({
-                        DBInstanceIdentifier: resource.identifier,
-                    })
-                );
-                const instance = response.DBInstances?.[0];
-                if (instance?.DBInstanceStatus) {
-                    states.push({
-                        identifier: resource.identifier,
-                        type: resource.type,
-                        state: instance.DBInstanceStatus,
-                    });
-                }
             }
+            states.push(state);
         }
 
         return states;
     }
 
-    private async waitForState(
-        targetState: string
-    ): Promise<void> {
-        const maxAttempts = this.retryConfig.waitForState.maxAttempts;
-        const delayMs = this.retryConfig.waitForState.delayMs;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const resourceStates = await this.getResourceStates();
-            const allInTargetState = resourceStates.every((rs) => rs.state === targetState);
-
-            if (allInTargetState) {
-                this.logger.info('[RdsService] RDS resources reached target state', {
-                    targetState,
-                    attempt,
-                    resources: resourceStates,
-                });
-                return;
-            }
-
-            this.logger.info('[RdsService] Waiting for RDS resources to reach target state', {
-                targetState,
-                attempt,
-                maxAttempts,
-                resources: resourceStates,
-            });
-
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
+    private async fetchSingleResourceState(resource: IRdsResource): Promise<IRdsResourceState | null> {
+        if (resource.type === RDS_RESOURCE_TYPES.CLUSTER) {
+            return await this.fetchClusterState(resource.identifier);
+        } else {
+            return await this.fetchInstanceState(resource.identifier);
         }
+    }
 
-        const finalStates = await this.getResourceStates();
-        throw new Error(
-            `[RdsService] RDS resources did not reach target state ${targetState} after ${maxAttempts} attempts. Final states: ${JSON.stringify(finalStates)}`
+    private async fetchClusterState(identifier: string): Promise<IRdsResourceState | null> {
+        const response = await this.rdsClient.send(
+            new DescribeDBClustersCommand({
+                DBClusterIdentifier: identifier,
+            })
+        );
+        const cluster = response.DBClusters?.[0];
+        
+        if (cluster?.Status) {
+            return {
+                identifier,
+                type: RDS_RESOURCE_TYPES.CLUSTER,
+                state: cluster.Status,
+            };
+        }
+        
+        return null;
+    }
+
+    private async fetchInstanceState(identifier: string): Promise<IRdsResourceState | null> {
+        const response = await this.rdsClient.send(
+            new DescribeDBInstancesCommand({
+                DBInstanceIdentifier: identifier,
+            })
+        );
+        const instance = response.DBInstances?.[0];
+        
+        if (instance?.DBInstanceStatus) {
+            return {
+                identifier,
+                type: RDS_RESOURCE_TYPES.INSTANCE,
+                state: instance.DBInstanceStatus,
+            };
+        }
+        
+        return null;
+    }
+
+    private async fetchClusterCurrentState(clusterIdentifier: string): Promise<string | undefined> {
+        const describeResponse = await this.rdsClient.send(
+            new DescribeDBClustersCommand({ DBClusterIdentifier: clusterIdentifier })
+        );
+        return describeResponse.DBClusters?.[0]?.Status;
+    }
+
+    private findClusterResource(clusterIdentifier: string): IRdsResource | undefined {
+        return this.rdsResources.find(
+            r => r.identifier === clusterIdentifier && r.type === RDS_RESOURCE_TYPES.CLUSTER
         );
     }
-}
 
+    private hasNoResources(): boolean {
+        return this.rdsResources.length === 0;
+    }
+
+    private isInvalidStateError(error: any): boolean {
+        return RdsService.INVALID_STATE_ERROR_CODES.includes(error.name);
+    }
+
+    private async delay(ms: number): Promise<void> {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+}

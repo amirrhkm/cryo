@@ -2,7 +2,7 @@ import { IProps } from "../../interfaces";
 import { Duration } from "aws-cdk-lib";
 import { Runtime } from "aws-cdk-lib/aws-lambda";
 
-export const ShellSgUatProps: IProps = {
+export const RonposUatProps: IProps = {
     vpc: {
         id: "vpc-02bf1d426732d7280",
         sg: "sg-0b2cf16fe8a4cb0cd",
@@ -77,17 +77,20 @@ export const ShellSgUatProps: IProps = {
             name: [
                 "atg-ronpos-shell-sg-uat-infra-eventlistener6A003A62-Gcq1NIlp8Flo",
                 "gm-ronpos-sg-uat-app-lambdasfileeventhandlerfiletri-A2cV1A4IkqXl",
-                "hos-shell-sg-uat-gsap-job-jobs3triggerEventsRuleED7-Wx82QkhQkJ40",
                 "gm-ronpos-sg-uat-app-lambdasscheduledeventhandlermo-5fsCqDr0rMSk",
+                "hos-shell-sg-uat-gsap-job-jobs3triggerEventsRuleED7-Wx82QkhQkJ40",
                 "hos-shell-sg-uat-gsap-job-scheduletriggerEventsRule-tUyMeGQCug6W",
+                "hos-shell-in-uat-gsap-job-jobs3triggerEventsRuleED7-tSPFjlpPiIBr",
+                "hos-shell-in-uat-gsap-job-scheduletriggerEventsRule-IjKdljFy2USV",
                 "sira-ronpos-shell-sg-uat-app-eventlistener6A003A62-G4B7rS3Y8bJE",
                 "kpmg-shell-sg-uat-lambda-KpmgMonthlyRule93968FD8-RYfMgGbj2Csw",
                 "kpmg-shell-sg-uat-lambda-KpmgDailyRuleD7EE8A31-DoUSaoXVUy4O",
                 "ronpos-uat-inventory-generate-opening-stock-f5",
                 "ronpos-shell-sg-uat-fuel-updater-rule-1",
+                "ronpos-shell-in-uat-fuel-updater-rule-1",
                 "rsts-pmf-ho-ronpos-uat-lambda-event-rule",
-                "refresh-balance-cold-rule",
-                "refresh-balance-rule",
+                "ronpos-uat-wetstock-refresh-balance-cold",
+                "ronpos-uat-wetstock-refresh-balance",
                 "vmi-ho-lambda-event-rule"
             ]
         },

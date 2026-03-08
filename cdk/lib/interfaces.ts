@@ -88,6 +88,6 @@ export interface IVpcProps {
 
 export type IEnvironment =
     | "shell-my-uat"
-    | "shell-sg-uat"
+    | "ronpos-uat"
     | "bhp-uat";
 

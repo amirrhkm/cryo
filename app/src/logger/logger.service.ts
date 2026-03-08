@@ -3,18 +3,21 @@ import { ILogger, ILogEntry } from './logger.interface';
 
 export class LoggerService implements ILogger {
     private readonly requestId?: string;
+    private readonly prefix?: string;
 
-    constructor(context?: Context) {
+    constructor(context?: Context, serviceName?: string) {
         this.requestId = context?.awsRequestId;
+        this.prefix = serviceName ? `[${serviceName}]` : undefined;
     }
 
     private log(level: string, message: string, meta?: any): void {
+        const formattedMessage = this.formatMessage(message);
         const logEntry: ILogEntry = {
             timestamp: new Date().toISOString(),
             level,
-            message,
+            message: formattedMessage,
             requestId: this.requestId,
-            ...meta,
+            ...(meta != null ? { meta } : {}),
         };
         console.log(JSON.stringify(logEntry));
     }
@@ -29,6 +32,10 @@ export class LoggerService implements ILogger {
 
     warn(message: string, meta?: any): void {
         this.log('WARN', message, meta);
+    }
+
+    private formatMessage(message: string): string {
+        return this.prefix ? `${this.prefix} ${message}` : message;
     }
 }
 

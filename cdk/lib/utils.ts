@@ -6,9 +6,9 @@ import { IAccount, IEnvironment, IProps, ITags } from "./interfaces";
 import { ShellMyUatStage } from "./stages/shell-my-uat/stage";
 import { ShellMyUatAccount } from "./stages/shell-my-uat/account";
 import { ShellMyUatProps } from "./stages/shell-my-uat/props";
-import { ShellSgUatStage } from "./stages/shell-sg-uat/stage";
-import { ShellSgUatAccount } from "./stages/shell-sg-uat/account";
-import { ShellSgUatProps } from "./stages/shell-sg-uat/props";
+import { RonposUatStage } from "./stages/ronpos-uat/stage";
+import { RonposUatAccount } from "./stages/ronpos-uat/account";
+import { RonposUatProps } from "./stages/ronpos-uat/props";
 import { BhpUatStage } from "./stages/bhp-uat/stage";
 import { BhpUatAccount } from "./stages/bhp-uat/account";
 import { BhpUatProps } from "./stages/bhp-uat/props";
@@ -32,8 +32,8 @@ export const executeStage = (
             });
             return;
 
-        case 'shell-sg-uat':
-            new ShellSgUatStage(app, `cryo-${deployTarget}`, {
+        case 'ronpos-uat':
+            new RonposUatStage(app, `cryo-${deployTarget}`, {
                 env: account,
                 props: props,
                 deployTarget: deployTarget,
@@ -64,8 +64,8 @@ export const getAccount = (deployTarget: IEnvironment): IAccount => {
         case 'shell-my-uat':
             return ShellMyUatAccount;
 
-        case 'shell-sg-uat':
-            return ShellSgUatAccount;
+        case 'ronpos-uat':
+            return RonposUatAccount;
 
         case 'bhp-uat':
             return BhpUatAccount;
@@ -82,8 +82,8 @@ export const getProps = (deployTarget: IEnvironment): IProps => {
         case 'shell-my-uat':
             return ShellMyUatProps;
 
-        case 'shell-sg-uat':
-            return ShellSgUatProps;
+        case 'ronpos-uat':
+            return RonposUatProps;
 
         case 'bhp-uat':
             return BhpUatProps;

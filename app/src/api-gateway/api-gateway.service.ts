@@ -1,3 +1,4 @@
+import { Context } from 'aws-lambda';
 import { 
     ApiGatewayV2Client, 
     CreateApiMappingCommand, 
@@ -5,38 +6,40 @@ import {
     GetApiMappingsCommand,
     GetApisCommand
 } from '@aws-sdk/client-apigatewayv2';
-import { LoggerService } from '../logger/logger.service';
-
-interface ApiGatewayConfig {
-    domain: string;
-    mapping: string;
-}
-
-interface ApiMappingState {
-    domain: string;
-    mapping: string;
-    apiMappingId?: string;
-}
+import { LoggerService } from '../logger';
+import { 
+    IApiGatewayConfig, 
+    API_GATEWAY_CONSTANTS, 
+    API_GATEWAY_LOG_MESSAGES as LOG,
+    PROMISE_SETTLED_STATUS,
+} from './api-gateway.interface';
 
 export class ApiGatewayService {
     private readonly client: ApiGatewayV2Client;
-    private readonly apiMappingStates: Map<string, ApiMappingState> = new Map();
     private readonly apiIdCache: Map<string, string> = new Map();
+    private readonly logger: LoggerService;
 
     constructor(
-        private readonly apiGateways: ApiGatewayConfig[],
-        private readonly logger: LoggerService
+        private readonly apiGateways: IApiGatewayConfig[],
+        context?: Context
     ) {
         this.client = new ApiGatewayV2Client({});
+        this.logger = new LoggerService(context, 'ApiGatewayService');
     }
 
-    async enableApiMappings(): Promise<void> {
-        if (this.apiGateways.length === 0) {
-            this.logger.info('[ApiGatewayService] No API Gateway mappings to enable');
+    async enableAllApiMappings(): Promise<void> {
+        if (this.hasNoApiGateways()) {
+            this.logger.info(LOG.NO_MAPPINGS_ENABLE);
             return;
         }
 
-        this.logger.info('[ApiGatewayService] Enabling API Gateway custom domain mappings', { 
+        const alreadyEnabled = await this.areAllMappingsInState(true);
+        if (alreadyEnabled) {
+            this.logger.info(LOG.ALREADY_IN_DESIRED_STATE, { desiredState: 'enabled' });
+            return;
+        }
+
+        this.logger.info(LOG.ENABLING_MAPPINGS, { 
             apiGateways: this.apiGateways,
             count: this.apiGateways.length 
         });
@@ -46,7 +49,7 @@ export class ApiGatewayService {
                 try {
                     await this.createApiMapping(config);
                 } catch (error: any) {
-                    this.logger.error('[ApiGatewayService] Failed to enable API mapping', {
+                    this.logger.error(LOG.FAILED_TO_ENABLE, {
                         domain: config.domain,
                         mapping: config.mapping,
                         error: error.message,
@@ -56,24 +59,32 @@ export class ApiGatewayService {
             })
         );
 
-        const failures = results.filter((r) => r.status === 'rejected');
+        const failures = results.filter((r) => r.status === PROMISE_SETTLED_STATUS.REJECTED);
         if (failures.length > 0) {
-            this.logger.warn('[ApiGatewayService] Some API mappings failed to enable', {
+            this.logger.warn(LOG.SOME_MAPPINGS_FAILED_ENABLE, {
                 failed: failures.length,
                 total: this.apiGateways.length,
             });
-        } else {
-            this.logger.info('[ApiGatewayService] All API mappings enabled successfully');
+            throw new Error(
+                `${LOG.SOME_MAPPINGS_FAILED_ENABLE}: ${failures.length}/${this.apiGateways.length} failed`
+            );
         }
+        this.logger.info(LOG.ALL_MAPPINGS_ENABLED);
     }
 
-    async disableApiMappings(): Promise<void> {
-        if (this.apiGateways.length === 0) {
-            this.logger.info('[ApiGatewayService] No API Gateway mappings to disable');
+    async disableAllApiMappings(): Promise<void> {
+        if (this.hasNoApiGateways()) {
+            this.logger.info(LOG.NO_MAPPINGS_DISABLE);
             return;
         }
 
-        this.logger.info('[ApiGatewayService] Disabling API Gateway custom domain mappings', { 
+        const alreadyDisabled = await this.areAllMappingsInState(false);
+        if (alreadyDisabled) {
+            this.logger.info(LOG.ALREADY_IN_DESIRED_STATE, { desiredState: 'disabled' });
+            return;
+        }
+
+        this.logger.info(LOG.DISABLING_MAPPINGS, { 
             apiGateways: this.apiGateways,
             count: this.apiGateways.length 
         });
@@ -83,7 +94,7 @@ export class ApiGatewayService {
                 try {
                     await this.deleteApiMapping(config);
                 } catch (error: any) {
-                    this.logger.error('[ApiGatewayService] Failed to disable API mapping', {
+                    this.logger.error(LOG.FAILED_TO_DISABLE, {
                         domain: config.domain,
                         mapping: config.mapping,
                         error: error.message,
@@ -93,33 +104,35 @@ export class ApiGatewayService {
             })
         );
 
-        const failures = results.filter((r) => r.status === 'rejected');
+        const failures = results.filter((r) => r.status === PROMISE_SETTLED_STATUS.REJECTED);
         if (failures.length > 0) {
-            this.logger.warn('[ApiGatewayService] Some API mappings failed to disable', {
+            this.logger.warn(LOG.SOME_MAPPINGS_FAILED_DISABLE, {
                 failed: failures.length,
                 total: this.apiGateways.length,
             });
-        } else {
-            this.logger.info('[ApiGatewayService] All API mappings disabled successfully');
+            throw new Error(
+                `${LOG.SOME_MAPPINGS_FAILED_DISABLE}: ${failures.length}/${this.apiGateways.length} failed`
+            );
         }
+        this.logger.info(LOG.ALL_MAPPINGS_DISABLED);
     }
 
-    private async createApiMapping(config: ApiGatewayConfig): Promise<void> {
+    private async createApiMapping(config: IApiGatewayConfig): Promise<void> {
         try {
-            const apiId = await this.getApiIdByName(config.mapping);
+            const apiId = await this.fetchApiIdByName(config.mapping);
             
             if (!apiId) {
-                this.logger.error('[ApiGatewayService] API not found by name', {
+                this.logger.error(LOG.API_NOT_FOUND, {
                     domain: config.domain,
                     apiName: config.mapping,
                 });
-                throw new Error(`API not found: ${config.mapping}`);
+                throw new Error(`${LOG.API_NOT_FOUND}: ${config.mapping}`);
             }
 
             const existingMappingId = await this.findExistingMapping(config.domain, apiId);
             
             if (existingMappingId) {
-                this.logger.info('[ApiGatewayService] API mapping already exists', {
+                this.logger.info(LOG.MAPPING_ALREADY_EXISTS, {
                     domain: config.domain,
                     apiName: config.mapping,
                     apiId,
@@ -132,25 +145,19 @@ export class ApiGatewayService {
                 new CreateApiMappingCommand({
                     DomainName: config.domain,
                     ApiId: apiId,
-                    Stage: '$default',
+                    Stage: API_GATEWAY_CONSTANTS.DEFAULT_STAGE,
                 })
             );
 
-            this.apiMappingStates.set(`${config.domain}:${config.mapping}`, {
-                domain: config.domain,
-                mapping: config.mapping,
-                apiMappingId: response.ApiMappingId,
-            });
-
-            this.logger.info('[ApiGatewayService] API mapping created', {
+            this.logger.info(LOG.MAPPING_CREATED, {
                 domain: config.domain,
                 apiName: config.mapping,
                 apiId,
                 apiMappingId: response.ApiMappingId,
             });
         } catch (error: any) {
-            if (error.name === 'ConflictException') {
-                this.logger.info('[ApiGatewayService] API mapping already exists (conflict)', {
+            if (error.name === API_GATEWAY_CONSTANTS.CONFLICT_EXCEPTION) {
+                this.logger.info(LOG.MAPPING_ALREADY_EXISTS_CONFLICT, {
                     domain: config.domain,
                     apiName: config.mapping,
                 });
@@ -160,12 +167,12 @@ export class ApiGatewayService {
         }
     }
 
-    private async deleteApiMapping(config: ApiGatewayConfig): Promise<void> {
+    private async deleteApiMapping(config: IApiGatewayConfig): Promise<void> {
         try {
-            const apiId = await this.getApiIdByName(config.mapping);
+            const apiId = await this.fetchApiIdByName(config.mapping);
             
             if (!apiId) {
-                this.logger.warn('[ApiGatewayService] API not found by name, cannot delete mapping', {
+                this.logger.warn(LOG.API_NOT_FOUND, {
                     domain: config.domain,
                     apiName: config.mapping,
                 });
@@ -175,7 +182,7 @@ export class ApiGatewayService {
             const apiMappingId = await this.findExistingMapping(config.domain, apiId);
 
             if (!apiMappingId) {
-                this.logger.info('[ApiGatewayService] API mapping not found, nothing to delete', {
+                this.logger.info(LOG.MAPPING_NOT_FOUND, {
                     domain: config.domain,
                     apiName: config.mapping,
                     apiId,
@@ -190,17 +197,15 @@ export class ApiGatewayService {
                 })
             );
 
-            this.apiMappingStates.delete(`${config.domain}:${config.mapping}`);
-
-            this.logger.info('[ApiGatewayService] API mapping deleted', {
+            this.logger.info(LOG.MAPPING_DELETED, {
                 domain: config.domain,
                 apiName: config.mapping,
                 apiId,
                 apiMappingId,
             });
         } catch (error: any) {
-            if (error.name === 'NotFoundException') {
-                this.logger.info('[ApiGatewayService] API mapping not found (already deleted)', {
+            if (error.name === API_GATEWAY_CONSTANTS.NOT_FOUND_EXCEPTION) {
+                this.logger.info(LOG.MAPPING_NOT_FOUND_ALREADY_DELETED, {
                     domain: config.domain,
                     apiName: config.mapping,
                 });
@@ -212,55 +217,105 @@ export class ApiGatewayService {
 
     private async findExistingMapping(domain: string, apiId: string): Promise<string | null> {
         try {
-            const response = await this.client.send(
-                new GetApiMappingsCommand({
-                    DomainName: domain,
-                })
-            );
+            let nextToken: string | undefined;
 
-            const mapping = response.Items?.find((item) => item.ApiId === apiId);
-            return mapping?.ApiMappingId || null;
+            do {
+                const response = await this.client.send(
+                    new GetApiMappingsCommand({
+                        DomainName: domain,
+                        NextToken: nextToken,
+                        MaxResults: API_GATEWAY_CONSTANTS.MAX_RESULTS,
+                    })
+                );
+
+                const mapping = response.Items?.find((item) => item.ApiId === apiId);
+                
+                if (mapping?.ApiMappingId) {
+                    return mapping.ApiMappingId;
+                }
+
+                nextToken = response.NextToken;
+            } while (nextToken);
+
+            return null;
         } catch (error: any) {
-            if (error.name === 'NotFoundException') {
+            if (error.name === API_GATEWAY_CONSTANTS.NOT_FOUND_EXCEPTION) {
                 return null;
             }
             throw error;
         }
     }
 
-    private async getApiIdByName(apiName: string): Promise<string | null> {
+    private async fetchApiIdByName(apiName: string): Promise<string | null> {
         if (this.apiIdCache.has(apiName)) {
             return this.apiIdCache.get(apiName)!;
         }
 
         try {
-            this.logger.info('[ApiGatewayService] Looking up API ID by name', { apiName });
+            this.logger.info(LOG.LOOKING_UP_API_ID, { apiName });
             
-            const response = await this.client.send(new GetApisCommand({}));
-            
-            const api = response.Items?.find((item) => item.Name === apiName);
-            
-            if (api?.ApiId) {
-                this.logger.info('[ApiGatewayService] Found API ID', {
-                    apiName,
-                    apiId: api.ApiId,
-                });
-                this.apiIdCache.set(apiName, api.ApiId);
-                return api.ApiId;
-            }
+            let nextToken: string | undefined;
+            let totalApis = 0;
+            const availableApiNames: string[] = [];
 
-            this.logger.warn('[ApiGatewayService] API not found', {
+            do {
+                const response = await this.client.send(
+                    new GetApisCommand({
+                        NextToken: nextToken,
+                        MaxResults: API_GATEWAY_CONSTANTS.MAX_RESULTS,
+                    })
+                );
+
+                totalApis += response.Items?.length || 0;
+
+                const api = response.Items?.find((item) => item.Name === apiName);
+                
+                if (api?.ApiId) {
+                    this.logger.info(LOG.FOUND_API_ID, {
+                        apiName,
+                        apiId: api.ApiId,
+                        totalApisScanned: totalApis,
+                    });
+                    this.apiIdCache.set(apiName, api.ApiId);
+                    return api.ApiId;
+                }
+
+                if (response.Items) {
+                    availableApiNames.push(...response.Items.map(item => item.Name || 'unnamed'));
+                }
+
+                nextToken = response.NextToken;
+            } while (nextToken);
+
+            this.logger.warn(LOG.API_NOT_FOUND_WARN, {
                 apiName,
-                availableApis: response.Items?.map(item => item.Name) || [],
+                totalApisScanned: totalApis,
+                availableApis: availableApiNames,
             });
             return null;
         } catch (error: any) {
-            this.logger.error('[ApiGatewayService] Failed to lookup API by name', {
+            this.logger.error(LOG.FAILED_TO_LOOKUP_API, {
                 apiName,
                 error: error.message,
             });
             throw error;
         }
     }
-}
 
+    private hasNoApiGateways(): boolean {
+        return this.apiGateways.length === 0;
+    }
+
+    private async areAllMappingsInState(enabled: boolean): Promise<boolean> {
+        const results = await Promise.allSettled(
+            this.apiGateways.map(async (config) => {
+                const apiId = await this.fetchApiIdByName(config.mapping);
+                if (!apiId) return !enabled;
+                const existingMappingId = await this.findExistingMapping(config.domain, apiId);
+                return enabled ? !!existingMappingId : !existingMappingId;
+            })
+        );
+
+        return results.every((r) => r.status === PROMISE_SETTLED_STATUS.FULFILLED && r.value === true);
+    }
+}

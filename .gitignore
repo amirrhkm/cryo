@@ -2,6 +2,11 @@
 *.js.map
 *.d.ts
 !jest.config.js
+!.eslintrc.js
+!prettier.config.js
+!commitlint.config.js
+!babel.config.js
+!webpack.config.js
 node_modules
 dist
 
@@ -20,3 +25,4 @@ cdk.out
 # OS
 .DS_Store
 
+doc/

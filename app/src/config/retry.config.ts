@@ -10,18 +10,6 @@ export interface IRetryConfig {
             delayMs: number;
         };
     };
-    ec2: {
-        waitForState: {
-            maxAttempts: number;
-            delayMs: number;
-        };
-    };
-    ecs: {
-        waitForServicesStable: {
-            maxAttempts: number;
-            delayMs: number;
-        };
-    };
     reconciliation: {
         rdsAutoRestartDelayMs: number;
     };
@@ -37,18 +25,6 @@ export const DEFAULT_RETRY_CONFIG: IRetryConfig = {
         waitForState: {
             maxAttempts: 100,
             delayMs: 300000,
-        },
-    },
-    ec2: {
-        waitForState: {
-            maxAttempts: 100,
-            delayMs: 60000,
-        },
-    },
-    ecs: {
-        waitForServicesStable: {
-            maxAttempts: 100,
-            delayMs: 60000,
         },
     },
     reconciliation: {

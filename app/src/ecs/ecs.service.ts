@@ -1,67 +1,48 @@
+import { Context } from 'aws-lambda';
 import {
     ECSClient,
     DescribeServicesCommand,
     UpdateServiceCommand,
 } from '@aws-sdk/client-ecs';
-import { LoggerService } from '../logger/logger.service';
+import { LoggerService } from '../logger';
 import { StateManagerService } from '../state-manager/state-manager.service';
-import { IEcsClusterConfig } from './ecs.interface';
-import { IRetryConfig } from '../config/retry.config';
+import { IEcsClusterConfig, EcsServiceState, ECS_SERVICE_STATES, ECS_LOG_MESSAGES as LOG } from './ecs.interface';
 
 export class EcsService {
     private readonly ecsClient: ECSClient;
+    private readonly logger: LoggerService;
 
     constructor(
         private readonly clusters: IEcsClusterConfig[],
-        private readonly retryConfig: IRetryConfig['ecs'],
         private readonly stateManager: StateManagerService,
-        private readonly logger: LoggerService
+        context?: Context
     ) {
         this.ecsClient = new ECSClient({});
+        this.logger = new LoggerService(context, 'EcsService');
     }
 
     async saveDesiredCounts(): Promise<void> {
-        this.logger.info('[EcsService] Saving ECS desired counts');
+        this.logger.info(LOG.SAVING_DESIRED_COUNTS);
 
         for (const cluster of this.clusters) {
             for (const serviceName of cluster.serviceNames) {
-                const desiredCount = await this.getServiceDesiredCount(
+                const desiredCount = await this.fetchServiceDesiredCount(
                     cluster.clusterName,
                     serviceName
                 );
-
-                if (desiredCount !== null) {
-                    await this.stateManager.setEcsDesiredCount(
-                        cluster.clusterName,
-                        serviceName,
-                        desiredCount
-                    );
-                }
+                await this.stateManager.setEcsDesiredCount(
+                    cluster.clusterName,
+                    serviceName,
+                    desiredCount
+                );
             }
         }
 
-        this.logger.info('[EcsService] Saved all ECS desired counts');
+        this.logger.info(LOG.SAVED_ALL_DESIRED_COUNTS);
     }
 
-    async scaleDown(saveCountsFirst: boolean = true): Promise<void> {
-        this.logger.info('[EcsService] Scaling down ECS services', { saveCountsFirst });
-
-        if (saveCountsFirst) {
-            await this.saveDesiredCounts();
-        }
-
-        for (const cluster of this.clusters) {
-            for (const serviceName of cluster.serviceNames) {
-                await this.updateServiceDesiredCount(cluster.clusterName, serviceName, 0);
-            }
-        }
-
-        await this.waitForServicesStable();
-        this.logger.info('[EcsService] All ECS services scaled down');
-    }
-
-    async scaleUp(): Promise<void> {
-        this.logger.info('[EcsService] Scaling up ECS services');
+    async scaleUpAllServicesWithoutWaiting(): Promise<void> {
+        this.logger.info(LOG.SCALING_UP);
 
         for (const cluster of this.clusters) {
             for (const serviceName of cluster.serviceNames) {
@@ -77,7 +58,7 @@ export class EcsService {
                         savedCount
                     );
                 } else {
-                    this.logger.warn('[EcsService] No saved desired count found for service', {
+                    this.logger.warn(LOG.NO_SAVED_COUNT_FOUND, {
                         cluster: cluster.clusterName,
                         service: serviceName,
                     });
@@ -85,40 +66,13 @@ export class EcsService {
             }
         }
 
-        await this.waitForServicesStable();
-        this.logger.info('[EcsService] All ECS services scaled up');
+        this.logger.info(LOG.SCALE_UP_COMMANDS_ISSUED);
     }
 
-    async scaleUpNoWait(): Promise<void> {
-        this.logger.info('[EcsService] Scaling up ECS services (no-wait)');
+    async scaleDownAllServicesWithoutWaiting(): Promise<void> {
+        this.logger.info(LOG.SCALING_DOWN);
 
-        for (const cluster of this.clusters) {
-            for (const serviceName of cluster.serviceNames) {
-                const savedCount = await this.stateManager.getEcsDesiredCount(
-                    cluster.clusterName,
-                    serviceName
-                );
-
-                if (savedCount !== null && savedCount > 0) {
-                    await this.updateServiceDesiredCount(
-                        cluster.clusterName,
-                        serviceName,
-                        savedCount
-                    );
-                } else {
-                    this.logger.warn('[EcsService] No saved desired count found for service', {
-                        cluster: cluster.clusterName,
-                        service: serviceName,
-                    });
-                }
-            }
-        }
-
-        this.logger.info('[EcsService] Scale up commands issued for all ECS services');
-    }
-
-    async scaleDownNoWait(): Promise<void> {
-        this.logger.info('[EcsService] Scaling down ECS services (no-wait)');
+        await this.saveDesiredCounts();
 
         for (const cluster of this.clusters) {
             for (const serviceName of cluster.serviceNames) {
@@ -126,11 +80,11 @@ export class EcsService {
             }
         }
 
-        this.logger.info('[EcsService] Scale down commands issued for all ECS services');
+        this.logger.info(LOG.SCALE_DOWN_COMMANDS_ISSUED);
     }
 
-    async checkAllServicesStable(targetCount: 'up' | 'down'): Promise<boolean> {
-        if (this.clusters.length === 0) {
+    async verifyAllServicesStable(targetCount: EcsServiceState): Promise<boolean> {
+        if (this.hasNoClusters()) {
             return true;
         }
 
@@ -144,9 +98,25 @@ export class EcsService {
                 })
             );
 
+            for (const failure of response.failures || []) {
+                this.logger.warn(LOG.SERVICE_DESCRIBE_FAILED, {
+                    arn: failure.arn,
+                    reason: failure.reason,
+                });
+            }
+
             for (const service of response.services || []) {
-                const expectedCount = targetCount === 'up' 
-                    ? (await this.stateManager.getEcsDesiredCount(cluster.clusterName, service.serviceName || '') || 0)
+                const serviceName = service.serviceName;
+                if (!serviceName) {
+                    this.logger.warn(LOG.NO_SAVED_COUNT_FOUND, {
+                        cluster: cluster.clusterName,
+                        service: '(missing service name)',
+                    });
+                    allStable = false;
+                    continue;
+                }
+                const expectedCount = targetCount === ECS_SERVICE_STATES.UP
+                    ? (await this.stateManager.getEcsDesiredCount(cluster.clusterName, serviceName) || 0)
                     : 0;
 
                 const isStable =
@@ -156,7 +126,7 @@ export class EcsService {
 
                 if (!isStable) {
                     allStable = false;
-                    this.logger.info('[EcsService] ECS service not yet stable', {
+                    this.logger.info(LOG.SERVICE_NOT_STABLE, {
                         cluster: cluster.clusterName,
                         service: service.serviceName,
                         runningCount: service.runningCount,
@@ -168,7 +138,7 @@ export class EcsService {
             }
         }
 
-        this.logger.info('[EcsService] Checked ECS service states', {
+        this.logger.info(LOG.CHECKED_SERVICE_STATES, {
             targetCount,
             allStable,
         });
@@ -176,20 +146,66 @@ export class EcsService {
         return allStable;
     }
 
-    async reconcile(desiredState: 'up' | 'down'): Promise<void> {
-        this.logger.info('[EcsService] Reconciling ECS services', { desiredState });
+    async reconcileToDesiredState(desiredState: EcsServiceState): Promise<void> {
+        if (this.hasNoClusters()) {
+            this.logger.info(LOG.NO_SERVICES_SET);
+            return;
+        }
 
-        if (desiredState === 'up') {
-            await this.scaleUp();
+        const alreadyInDesiredState = await this.verifyAllServicesStable(desiredState);
+        if (alreadyInDesiredState) {
+            this.logger.info(LOG.ALREADY_IN_DESIRED_STATE, { desiredState });
+            return;
+        }
+
+        this.logger.info(LOG.RECONCILING_SERVICES, { desiredState });
+
+        if (desiredState === ECS_SERVICE_STATES.UP) {
+            await this.scaleUpAllServices();
         } else {
-            await this.scaleDown(false);
+            await this.scaleDownAllServices();
+        }
+
+        this.logger.info(LOG.RECONCILE_COMMANDS_ISSUED);
+    }
+
+    private async scaleUpAllServices(): Promise<void> {
+        for (const cluster of this.clusters) {
+            for (const serviceName of cluster.serviceNames) {
+                const savedCount = await this.stateManager.getEcsDesiredCount(
+                    cluster.clusterName,
+                    serviceName
+                );
+
+                if (savedCount !== null && savedCount > 0) {
+                    await this.updateServiceDesiredCount(
+                        cluster.clusterName,
+                        serviceName,
+                        savedCount
+                    );
+                } else {
+                    this.logger.warn(LOG.NO_SAVED_COUNT_FOUND, {
+                        cluster: cluster.clusterName,
+                        service: serviceName,
+                    });
+                }
+            }
         }
     }
 
-    private async getServiceDesiredCount(
+    private async scaleDownAllServices(): Promise<void> {
+        await this.saveDesiredCounts();
+        for (const cluster of this.clusters) {
+            for (const serviceName of cluster.serviceNames) {
+                await this.updateServiceDesiredCount(cluster.clusterName, serviceName, 0);
+            }
+        }
+    }
+
+    private async fetchServiceDesiredCount(
         clusterName: string,
         serviceName: string
-    ): Promise<number | null> {
+    ): Promise<number> {
         try {
             const response = await this.ecsClient.send(
                 new DescribeServicesCommand({
@@ -198,19 +214,41 @@ export class EcsService {
                 })
             );
 
-            const service = response.services?.[0];
-            if (service && service.desiredCount !== undefined) {
-                this.logger.info('[EcsService] Retrieved ECS service desired count', {
-                    cluster: clusterName,
-                    service: serviceName,
-                    desiredCount: service.desiredCount,
-                });
-                return service.desiredCount;
+            const failures = response.failures || [];
+            if (failures.length > 0) {
+                for (const failure of failures) {
+                    this.logger.error(LOG.SERVICE_DESCRIBE_FAILED, {
+                        arn: failure.arn,
+                        reason: failure.reason,
+                        clusterName,
+                        serviceName,
+                    });
+                }
+                throw new Error(
+                    `${LOG.SERVICE_DESCRIBE_FAILED}: ${failures.length} failure(s) for ${clusterName}/${serviceName}`
+                );
             }
 
-            return null;
+            const service = response.services?.[0];
+            if (service?.desiredCount === undefined) {
+                this.logger.error(LOG.SERVICE_DESCRIBE_FAILED, {
+                    clusterName,
+                    serviceName,
+                    reason: 'No desiredCount in response',
+                });
+                throw new Error(
+                    `${LOG.SERVICE_DESCRIBE_FAILED}: no desiredCount for ${clusterName}/${serviceName}`
+                );
+            }
+
+            this.logger.info(LOG.RETRIEVED_DESIRED_COUNT, {
+                cluster: clusterName,
+                service: serviceName,
+                desiredCount: service.desiredCount,
+            });
+            return service.desiredCount;
         } catch (error: any) {
-            this.logger.error('[EcsService] Failed to get ECS service desired count', {
+            this.logger.error(LOG.FAILED_TO_GET_DESIRED_COUNT, {
                 cluster: clusterName,
                 service: serviceName,
                 error: error.message,
@@ -224,7 +262,7 @@ export class EcsService {
         serviceName: string,
         desiredCount: number
     ): Promise<void> {
-        this.logger.info('[EcsService] Updating ECS service desired count', {
+        this.logger.info(LOG.UPDATING_DESIRED_COUNT, {
             cluster: clusterName,
             service: serviceName,
             desiredCount,
@@ -238,62 +276,14 @@ export class EcsService {
             })
         );
 
-        this.logger.info('[EcsService] Updated ECS service desired count', {
+        this.logger.info(LOG.UPDATED_DESIRED_COUNT, {
             cluster: clusterName,
             service: serviceName,
             desiredCount,
         });
     }
 
-    private async waitForServicesStable(): Promise<void> {
-        const maxAttempts = this.retryConfig.waitForServicesStable.maxAttempts;
-        const delayMs = this.retryConfig.waitForServicesStable.delayMs;
-
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            let allStable = true;
-
-            for (const cluster of this.clusters) {
-                const response = await this.ecsClient.send(
-                    new DescribeServicesCommand({
-                        cluster: cluster.clusterName,
-                        services: cluster.serviceNames,
-                    })
-                );
-
-                for (const service of response.services || []) {
-                    const isStable =
-                        service.runningCount === service.desiredCount &&
-                        (service.deployments?.length || 0) <= 1;
-
-                    if (!isStable) {
-                        allStable = false;
-                        this.logger.info('[EcsService] ECS service not yet stable', {
-                            cluster: cluster.clusterName,
-                            service: service.serviceName,
-                            runningCount: service.runningCount,
-                            desiredCount: service.desiredCount,
-                            deployments: service.deployments?.length,
-                        });
-                    }
-                }
-            }
-
-            if (allStable) {
-                this.logger.info('[EcsService] All ECS services are stable', { attempt });
-                return;
-            }
-
-            this.logger.info('[EcsService] Waiting for ECS services to stabilize', {
-                attempt,
-                maxAttempts,
-            });
-
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
-        }
-
-        throw new Error(
-            `[EcsService] ECS services did not stabilize after ${maxAttempts} attempts`
-        );
+    private hasNoClusters(): boolean {
+        return this.clusters.length === 0;
     }
 }
-
